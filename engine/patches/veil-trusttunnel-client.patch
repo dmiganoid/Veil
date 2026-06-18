@@ -1,0 +1,750 @@
+﻿From a1439ebc1b29b45027453712935717605c0ed367 Mon Sep 17 00:00:00 2001
+From: dmiganoid <dmiganoid@gmail.com>
+Date: Fri, 19 Jun 2026 02:24:16 +0300
+Subject: [PATCH] Add Veil process-aware split tunneling
+
+---
+ README.md                                 |   7 +
+ core/include/vpn/internal/domain_filter.h |  11 +-
+ core/src/domain_filter.cpp                |  54 +++-
+ core/src/tun_device_listener.cpp          |   3 +-
+ core/src/tunnel.cpp                       |   5 +-
+ core/src/vpn_manager.cpp                  |   1 +
+ core/test/test_domain_filter.cpp          |  45 ++++
+ tcpip/CMakeLists.txt                      |   2 +
+ tcpip/include/tcpip/tcpip.h               |   1 +
+ tcpip/src/process_resolver.cpp            | 297 ++++++++++++++++++++++
+ tcpip/src/process_resolver.h              |  11 +
+ tcpip/src/tcp_conn_manager.cpp            |   3 +
+ tcpip/src/udp_conn_manager.cpp            |   3 +
+ trusttunnel/README.md                     |   4 +
+ trusttunnel/setup_wizard/src/settings.rs  |   6 +
+ 15 files changed, 447 insertions(+), 6 deletions(-)
+ create mode 100644 tcpip/src/process_resolver.cpp
+ create mode 100644 tcpip/src/process_resolver.h
+
+diff --git a/README.md b/README.md
+index e1bfc61..c407166 100644
+--- a/README.md
++++ b/README.md
+@@ -1,4 +1,11 @@
+ <!-- markdownlint-disable MD041 -->
++
++# VeilEngine
++
++VeilEngine is the Veil-maintained fork of TrustTunnel Client. It keeps the upstream TrustTunnel protocol implementation and adds the runtime behavior Veil needs, including process-aware split tunneling on Windows.
++
++Veil downloads prebuilt VeilEngine runtime assets from this repository. Use the upstream TrustTunnelClient releases only if you do not need Veil's application-based split tunneling features.
++
+ <p align="center">
+ <picture>
+ <source media="(prefers-color-scheme: dark)" srcset="https://cdn.adguardcdn.com/website/github.com/TrustTunnel/logo_dark.svg" width="300px" alt="TrustTunnel" />
+diff --git a/core/include/vpn/internal/domain_filter.h b/core/include/vpn/internal/domain_filter.h
+index 6019512..514ae0d 100644
+--- a/core/include/vpn/internal/domain_filter.h
++++ b/core/include/vpn/internal/domain_filter.h
+@@ -2,9 +2,11 @@
+ 
+ #include <bitset>
+ #include <chrono>
++#include <optional>
+ #include <set>
+ #include <string>
+ #include <string_view>
++#include <unordered_map>
+ #include <unordered_set>
+ #include <variant>
+ #include <vector>
+@@ -22,6 +24,7 @@ enum DomainFilterValidationStatus {
+     DFVS_OK_CIDR,
+     DFVS_OK_DOMAIN,
+     DFVS_OK_PORT,
++    DFVS_OK_APP,
+     DFVS_MALFORMED,
+ };
+ 
+@@ -112,19 +115,25 @@ private:
+     struct PortOnlyEntry {
+         uint16_t port;
+     };
++    struct AppEntryInfo {
++        std::string name;
++    };
+     struct DomainEntryMalformed {};
+-    using ParseResult = std::variant<SocketAddress, CidrRange, DomainEntryInfo, PortOnlyEntry, DomainEntryMalformed>;
++    using ParseResult =
++            std::variant<SocketAddress, CidrRange, DomainEntryInfo, PortOnlyEntry, AppEntryInfo, DomainEntryMalformed>;
+ 
+     VpnMode m_mode = VPN_MODE_GENERAL;
+     std::unordered_map<std::string, MatchFlagsSet> m_domains; // key - domain name / value - set of `MatchFlags`
+     std::unordered_set<SocketAddress> m_addresses;
+     std::unordered_set<uint16_t> m_ports_only;
++    std::unordered_set<std::string> m_apps;
+     ag::CidrRangeSet m_cidr_ranges;
+     ag::LruTimeoutCache<ag::SockAddrTag, std::string> m_resolved_tags{DEFAULT_CACHE_SIZE, DEFAULT_TAG_TTL};
+     ag::LruTimeoutCache<SocketAddress, uint8_t> m_exclusion_suspects{DEFAULT_CACHE_SIZE, DEFAULT_TAG_TTL};
+     ag::Logger m_log{"DOMAIN_FILTER"};
+ 
+     static ParseResult parse_entry(std::string_view entry);
++    static std::string normalize_app_name(std::string_view app_name);
+ };
+ 
+ } // namespace ag
+diff --git a/core/src/domain_filter.cpp b/core/src/domain_filter.cpp
+index c1753a5..bc4d0f0 100644
+--- a/core/src/domain_filter.cpp
++++ b/core/src/domain_filter.cpp
+@@ -1,5 +1,8 @@
+ #include "vpn/internal/domain_filter.h"
+ 
++#include <algorithm>
++#include <cctype>
++
+ #include "common/defs.h"
+ #include "vpn/internal/utils.h"
+ #include "vpn/utils.h"
+@@ -10,6 +13,9 @@ namespace ag {
+ 
+ static constexpr std::string_view WWW_PREFIX = "www.";
+ static constexpr std::string_view WILDCARD_PREFIX = "*.";
++static constexpr std::string_view APP_PREFIX = "app:";
++static constexpr std::string_view PROCESS_PREFIX = "process:";
++static constexpr std::string_view WINDOWS_EXECUTABLE_SUFFIX = ".exe";
+ 
+ enum DomainFilter::MatchFlags : uint32_t {
+     DFMM_EXACT,      // match the domain itself and www. + the domain
+@@ -25,14 +31,37 @@ DomainFilterValidationStatus DomainFilter::validate_entry(std::string_view entry
+     static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_ADDR, ParseResult>, SocketAddress>);
+     static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_CIDR, ParseResult>, CidrRange>);
+     static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_DOMAIN, ParseResult>, DomainEntryInfo>);
+-    static_assert(std::is_same_v<std::variant_alternative_t<DFVS_MALFORMED, ParseResult>, DomainEntryMalformed>);
+     static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_PORT, ParseResult>, PortOnlyEntry>);
+-    static_assert(std::variant_size_v<ParseResult> == 5);
++    static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_APP, ParseResult>, AppEntryInfo>);
++    static_assert(std::is_same_v<std::variant_alternative_t<DFVS_MALFORMED, ParseResult>, DomainEntryMalformed>);
++    static_assert(std::variant_size_v<ParseResult> == 6);
+ 
+     return DomainFilterValidationStatus(result.index());
+ }
+ 
++std::string DomainFilter::normalize_app_name(std::string_view app_name) {
++    size_t last_separator = app_name.find_last_of("\\/");
++    if (last_separator != std::string_view::npos) {
++        app_name.remove_prefix(last_separator + 1);
++    }
++
++    std::string result(app_name);
++    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char ch) {
++        return static_cast<char>(std::tolower(ch));
++    });
++    return result;
++}
++
+ DomainFilter::ParseResult DomainFilter::parse_entry(std::string_view entry) {
++    if (starts_with(entry, APP_PREFIX) || starts_with(entry, PROCESS_PREFIX)) {
++        entry.remove_prefix(starts_with(entry, APP_PREFIX) ? APP_PREFIX.length() : PROCESS_PREFIX.length());
++        std::string app_name = normalize_app_name(entry);
++        if (app_name.empty()) {
++            return DomainEntryMalformed{};
++        }
++        return AppEntryInfo{std::move(app_name)};
++    }
++
+     SocketAddress addr{};
+     Result split = utils::split_host_port(entry);
+     if (!split.has_error()) {
+@@ -56,6 +85,14 @@ DomainFilter::ParseResult DomainFilter::parse_entry(std::string_view entry) {
+         return range;
+     }
+ 
++    if (!starts_with(entry, WILDCARD_PREFIX)) {
++        std::string app_name = normalize_app_name(entry);
++        if (app_name.length() > WINDOWS_EXECUTABLE_SUFFIX.length()
++                && app_name.ends_with(WINDOWS_EXECUTABLE_SUFFIX)) {
++            return AppEntryInfo{std::move(app_name)};
++        }
++    }
++
+     std::string_view domain = entry;
+     if (domain.starts_with("*.")) {
+         domain.remove_prefix(2);
+@@ -93,6 +130,7 @@ bool DomainFilter::update_exclusions(VpnMode mode_, std::string_view exclusions)
+     m_domains.clear();
+     m_addresses.clear();
+     m_ports_only.clear();
++    m_apps.clear();
+     m_exclusion_suspects.clear();
+     m_cidr_ranges.clear();
+ 
+@@ -110,6 +148,9 @@ bool DomainFilter::update_exclusions(VpnMode mode_, std::string_view exclusions)
+         } else if (auto *port_only = std::get_if<PortOnlyEntry>(&result); port_only != nullptr) {
+             log_filter(this, trace, "Entry added in ports only table: {}", port_only->port);
+             m_ports_only.insert(port_only->port);
++        } else if (auto *app_info = std::get_if<AppEntryInfo>(&result); app_info != nullptr) {
++            log_filter(this, trace, "Entry added in app table: {}", app_info->name);
++            m_apps.insert(std::move(app_info->name));
+         } else {
+             auto status = std::get<DomainEntryMalformed>(result);
+             (void) status;
+@@ -168,6 +209,15 @@ DomainFilterMatchStatus DomainFilter::match_domain(std::string_view domain) cons
+ DomainFilterMatchResult DomainFilter::match_tag(const SockAddrTag &tag) const {
+     DomainFilterMatchResult result{.status = DFMS_DEFAULT};
+ 
++    if (!tag.appname.empty()) {
++        std::string app_name = normalize_app_name(tag.appname);
++        if (m_apps.contains(app_name)) {
++            log_filter(this, trace, "App matched against exclusion list: {}", app_name);
++            result.status = DFMS_EXCLUSION;
++            return result;
++        }
++    }
++
+     SocketAddress addr_no_port = tag.addr;
+     addr_no_port.set_port(0);
+ 
+diff --git a/core/src/tun_device_listener.cpp b/core/src/tun_device_listener.cpp
+index f5f7682..d2ba330 100644
+--- a/core/src/tun_device_listener.cpp
++++ b/core/src/tun_device_listener.cpp
+@@ -166,7 +166,8 @@ void TunListener::tcpip_handler(void *arg, TcpipEvent what, void *data) {
+ 
+         TunnelAddress dst(*(SocketAddress *) tcp_event->dst);
+ 
+-        ClientConnectRequest event = {tcp_event->id, tcp_event->proto, tcp_event->src, &dst};
++        ClientConnectRequest event = {tcp_event->id, tcp_event->proto, tcp_event->src, &dst,
++                tcp_event->app_name != nullptr ? std::string_view{tcp_event->app_name} : std::string_view{}, 0};
+         listener->handler.func(listener->handler.arg, CLIENT_EVENT_CONNECT_REQUEST, &event);
+         break;
+     }
+diff --git a/core/src/tunnel.cpp b/core/src/tunnel.cpp
+index f5d049f..695ceb5 100644
+--- a/core/src/tunnel.cpp
++++ b/core/src/tunnel.cpp
+@@ -1549,8 +1549,9 @@ void Tunnel::listener_handler(const std::shared_ptr<ClientListener> &listener, C
+             conn->requested_at = std::chrono::high_resolution_clock::now();
+         }
+ 
+-        log_conn(this, conn, dbg, "New client connection request: {}->{} (proto: {})", *client_event->src,
+-                tunnel_addr_to_str(&client_event_addr.dst), client_event->protocol);
++        log_conn(this, conn, dbg, "New client connection request: {}->{} (proto: {}, app: {})", *client_event->src,
++                tunnel_addr_to_str(&client_event_addr.dst), client_event->protocol,
++                conn->app_name.empty() ? "<unknown>" : conn->app_name);
+ 
+         add_connection(this, conn);
+ 
+diff --git a/core/src/vpn_manager.cpp b/core/src/vpn_manager.cpp
+index 6694f6e..2548bca 100644
+--- a/core/src/vpn_manager.cpp
++++ b/core/src/vpn_manager.cpp
+@@ -654,6 +654,7 @@ VpnExclusionValidationStatus vpn_validate_exclusion(const char *text) {
+     case DFVS_OK_CIDR:
+     case DFVS_OK_DOMAIN:
+     case DFVS_OK_PORT:
++    case DFVS_OK_APP:
+         return VPN_EVS_OK;
+     case DFVS_MALFORMED:
+         return VPN_EVS_MALFORMED;
+diff --git a/core/test/test_domain_filter.cpp b/core/test/test_domain_filter.cpp
+index 042e8c1..258951b 100644
+--- a/core/test/test_domain_filter.cpp
++++ b/core/test/test_domain_filter.cpp
+@@ -140,6 +140,45 @@ static const MatchTestParam ADDRESS_NOMATCH_TEST_SAMPLES[] = {
+ };
+ INSTANTIATE_TEST_SUITE_P(Simple, AddressNoMatch, testing::ValuesIn(ADDRESS_NOMATCH_TEST_SAMPLES));
+ 
++struct AppTestParam {
++    std::string_view exclusions;
++    std::string app;
++};
++
++class AppMatch : public testing::TestWithParam<AppTestParam> {
++public:
++    DomainFilter filter = {};
++    SocketAddress address{"1.2.3.4:443"};
++
++    void SetUp() override {
++        ASSERT_TRUE(address.valid());
++        ASSERT_TRUE(filter.update_exclusions(VPN_MODE_GENERAL, GetParam().exclusions));
++    }
++};
++
++TEST_P(AppMatch, Test) {
++    ASSERT_EQ(DFMS_EXCLUSION, filter.match_tag({address, GetParam().app}).status);
++}
++
++static const AppTestParam APP_MATCH_TEST_SAMPLES[] = {
++        {"deadlock.exe", "deadlock.exe"},
++        {"DEADLOCK.EXE", "deadlock.exe"},
++        {"app:deadlock.exe", R"(C:\Program Files (x86)\Steam\steamapps\common\Deadlock\deadlock.exe)"},
++        {"process:steam.exe", "STEAM.EXE"},
++};
++INSTANTIATE_TEST_SUITE_P(Simple, AppMatch, testing::ValuesIn(APP_MATCH_TEST_SAMPLES));
++
++TEST(AppFilterTest, DifferentAppDoesNotMatch) {
++    DomainFilter filter = {};
++    SocketAddress address{"1.2.3.4:443"};
++    ASSERT_TRUE(address.valid());
++
++    ASSERT_TRUE(filter.update_exclusions(VPN_MODE_GENERAL, "deadlock.exe"));
++
++    ASSERT_EQ(DFMS_DEFAULT, filter.match_tag({address, "steam.exe"}).status);
++    ASSERT_EQ(DFMS_DEFAULT, filter.match_tag({address, ""}).status);
++}
++
+ struct TagsTestParam {
+     std::string address;
+     std::string app;
+@@ -201,6 +240,10 @@ TEST(DomainFilterTest, ValidateEntry) {
+     ASSERT_EQ(DFVS_OK_ADDR, DomainFilter::validate_entry("fd::"));
+     ASSERT_EQ(DFVS_OK_CIDR, DomainFilter::validate_entry("fd::/64"));
+     ASSERT_EQ(DFVS_OK_DOMAIN, DomainFilter::validate_entry("*.google"));
++    ASSERT_EQ(DFVS_OK_APP, DomainFilter::validate_entry("deadlock.exe"));
++    ASSERT_EQ(DFVS_OK_APP, DomainFilter::validate_entry("app:deadlock.exe"));
++    ASSERT_EQ(DFVS_OK_APP, DomainFilter::validate_entry("process:deadlock.exe"));
++    ASSERT_EQ(DFVS_OK_DOMAIN, DomainFilter::validate_entry("*.exe"));
+ 
+     ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("1.1.1.1:0"));
+     ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("1.2.3.0/33"));
+@@ -216,6 +259,8 @@ TEST(DomainFilterTest, ValidateEntry) {
+     ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("*:0"));
+     ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("*:65536"));
+     ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("*:abc"));
++    ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("app:"));
++    ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("process:"));
+ 
+     ASSERT_EQ(DFVS_OK_PORT, DomainFilter::validate_entry("*:80"));
+     ASSERT_EQ(DFVS_OK_PORT, DomainFilter::validate_entry("*:443"));
+diff --git a/tcpip/CMakeLists.txt b/tcpip/CMakeLists.txt
+index 4f842a5..3ce0f04 100644
+--- a/tcpip/CMakeLists.txt
++++ b/tcpip/CMakeLists.txt
+@@ -36,6 +36,8 @@ set(SOURCE_FILES
+         ${TCPIP_SOURCE_DIR}/udp_conn_manager.cpp
+         ${TCPIP_SOURCE_DIR}/tcpip_common.h
+         ${TCPIP_SOURCE_DIR}/tcpip_common.cpp
++        ${TCPIP_SOURCE_DIR}/process_resolver.h
++        ${TCPIP_SOURCE_DIR}/process_resolver.cpp
+         ${TCPIP_SOURCE_DIR}/ip_hooks.h
+         ${TCPIP_SOURCE_DIR}/ip_hooks.cpp
+         ${TCPIP_SOURCE_DIR}/tcpip_util.cpp
+diff --git a/tcpip/include/tcpip/tcpip.h b/tcpip/include/tcpip/tcpip.h
+index c72dc9e..9a763e6 100644
+--- a/tcpip/include/tcpip/tcpip.h
++++ b/tcpip/include/tcpip/tcpip.h
+@@ -67,6 +67,7 @@ typedef struct {
+     int proto;                /**< connection protocol */
+     const SocketAddress *src; /**< source address of connection */
+     const SocketAddress *dst; /**< destination address of connection */
++    const char *app_name;     /**< application that initiated this connection, if known */
+ } TcpipConnectRequestEvent;
+ 
+ typedef struct {
+diff --git a/tcpip/src/process_resolver.cpp b/tcpip/src/process_resolver.cpp
+new file mode 100644
+index 0000000..af20df5
+--- /dev/null
++++ b/tcpip/src/process_resolver.cpp
+@@ -0,0 +1,297 @@
++#include "process_resolver.h"
++
++#include "vpn/platform.h"
++
++#include <algorithm>
++#include <cstring>
++#include <string_view>
++#include <vector>
++
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
++namespace ag {
++
++#ifdef _WIN32
++
++static DWORD network_port(const SocketAddress &addr) {
++    return htons(addr.port());
++}
++
++static bool is_ipv4(const SocketAddress &addr) {
++    return addr.c_sockaddr() != nullptr && addr.c_sockaddr()->sa_family == AF_INET;
++}
++
++static bool is_ipv6(const SocketAddress &addr) {
++    return addr.c_sockaddr() != nullptr && addr.c_sockaddr()->sa_family == AF_INET6;
++}
++
++static const sockaddr_in *as_ipv4(const SocketAddress &addr) {
++    return (const sockaddr_in *) addr.c_sockaddr();
++}
++
++static const sockaddr_in6 *as_ipv6(const SocketAddress &addr) {
++    return (const sockaddr_in6 *) addr.c_sockaddr();
++}
++
++static bool ipv4_matches(DWORD row_addr, const SocketAddress &addr) {
++    return is_ipv4(addr) && row_addr == as_ipv4(addr)->sin_addr.S_un.S_addr;
++}
++
++static bool ipv6_matches(const UCHAR row_addr[16], const SocketAddress &addr) {
++    return is_ipv6(addr) && std::memcmp(row_addr, as_ipv6(addr)->sin6_addr.s6_addr, 16) == 0;
++}
++
++static bool ipv6_is_any(const UCHAR row_addr[16]) {
++    return std::all_of(row_addr, row_addr + 16, [](UCHAR b) { return b == 0; });
++}
++
++static std::string utf8_basename(std::wstring_view path) {
++    const size_t separator = path.find_last_of(L"\\/");
++    if (separator != std::wstring_view::npos) {
++        path.remove_prefix(separator + 1);
++    }
++
++    if (path.empty() || path.length() > INT_MAX) {
++        return {};
++    }
++
++    int required = WideCharToMultiByte(CP_UTF8, 0, path.data(), (int) path.length(), nullptr, 0, nullptr, nullptr);
++    if (required <= 0) {
++        return {};
++    }
++
++    std::string result((size_t) required, '\0');
++    int written = WideCharToMultiByte(
++            CP_UTF8, 0, path.data(), (int) path.length(), result.data(), required, nullptr, nullptr);
++    if (written <= 0) {
++        return {};
++    }
++
++    result.resize((size_t) written);
++    return result;
++}
++
++static std::string process_name_from_pid(DWORD pid) {
++    if (pid == 0) {
++        return {};
++    }
++
++    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
++    if (process == nullptr) {
++        return {};
++    }
++
++    std::wstring path(32768, L'\0');
++    DWORD size = (DWORD) path.size();
++    if (!QueryFullProcessImageNameW(process, 0, path.data(), &size)) {
++        CloseHandle(process);
++        return {};
++    }
++
++    CloseHandle(process);
++    path.resize(size);
++    return utf8_basename(path);
++}
++
++static DWORD unique_pid_or_ambiguous(DWORD current, bool &ambiguous, DWORD candidate) {
++    if (candidate == 0) {
++        return current;
++    }
++
++    if (current == 0) {
++        return candidate;
++    }
++
++    if (current != candidate) {
++        ambiguous = true;
++    }
++
++    return current;
++}
++
++static DWORD lookup_tcp4_owner_pid(const SocketAddress &src, const SocketAddress &dst) {
++    ULONG size = 0;
++    ULONG status = GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
++    if (status != ERROR_INSUFFICIENT_BUFFER || size == 0) {
++        return 0;
++    }
++
++    std::vector<uint8_t> buffer(size);
++    status = GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
++    if (status != ERROR_SUCCESS) {
++        return 0;
++    }
++
++    const auto *table = (const MIB_TCPTABLE_OWNER_PID *) buffer.data();
++    const DWORD src_port = network_port(src);
++    const DWORD dst_port = network_port(dst);
++    DWORD fallback_pid = 0;
++    bool fallback_ambiguous = false;
++
++    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
++        const MIB_TCPROW_OWNER_PID &row = table->table[i];
++        if (row.dwLocalPort != src_port || row.dwRemotePort != dst_port || !ipv4_matches(row.dwRemoteAddr, dst)) {
++            continue;
++        }
++
++        if (ipv4_matches(row.dwLocalAddr, src)) {
++            return row.dwOwningPid;
++        }
++
++        if (row.dwLocalAddr == INADDR_ANY) {
++            fallback_pid = unique_pid_or_ambiguous(fallback_pid, fallback_ambiguous, row.dwOwningPid);
++        }
++    }
++
++    return fallback_ambiguous ? 0 : fallback_pid;
++}
++
++static DWORD lookup_tcp6_owner_pid(const SocketAddress &src, const SocketAddress &dst) {
++    ULONG size = 0;
++    ULONG status = GetExtendedTcpTable(nullptr, &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
++    if (status != ERROR_INSUFFICIENT_BUFFER || size == 0) {
++        return 0;
++    }
++
++    std::vector<uint8_t> buffer(size);
++    status = GetExtendedTcpTable(buffer.data(), &size, FALSE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
++    if (status != ERROR_SUCCESS) {
++        return 0;
++    }
++
++    const auto *table = (const MIB_TCP6TABLE_OWNER_PID *) buffer.data();
++    const DWORD src_port = network_port(src);
++    const DWORD dst_port = network_port(dst);
++    DWORD fallback_pid = 0;
++    bool fallback_ambiguous = false;
++
++    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
++        const MIB_TCP6ROW_OWNER_PID &row = table->table[i];
++        if (row.dwLocalPort != src_port || row.dwRemotePort != dst_port || !ipv6_matches(row.ucRemoteAddr, dst)) {
++            continue;
++        }
++
++        if (ipv6_matches(row.ucLocalAddr, src)) {
++            return row.dwOwningPid;
++        }
++
++        if (ipv6_is_any(row.ucLocalAddr)) {
++            fallback_pid = unique_pid_or_ambiguous(fallback_pid, fallback_ambiguous, row.dwOwningPid);
++        }
++    }
++
++    return fallback_ambiguous ? 0 : fallback_pid;
++}
++
++static DWORD lookup_udp4_owner_pid(const SocketAddress &src) {
++    ULONG size = 0;
++    ULONG status = GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
++    if (status != ERROR_INSUFFICIENT_BUFFER || size == 0) {
++        return 0;
++    }
++
++    std::vector<uint8_t> buffer(size);
++    status = GetExtendedUdpTable(buffer.data(), &size, FALSE, AF_INET, UDP_TABLE_OWNER_PID, 0);
++    if (status != ERROR_SUCCESS) {
++        return 0;
++    }
++
++    const auto *table = (const MIB_UDPTABLE_OWNER_PID *) buffer.data();
++    const DWORD src_port = network_port(src);
++    DWORD fallback_pid = 0;
++    bool fallback_ambiguous = false;
++
++    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
++        const MIB_UDPROW_OWNER_PID &row = table->table[i];
++        if (row.dwLocalPort != src_port) {
++            continue;
++        }
++
++        if (ipv4_matches(row.dwLocalAddr, src)) {
++            return row.dwOwningPid;
++        }
++
++        if (row.dwLocalAddr == INADDR_ANY) {
++            fallback_pid = unique_pid_or_ambiguous(fallback_pid, fallback_ambiguous, row.dwOwningPid);
++        }
++    }
++
++    return fallback_ambiguous ? 0 : fallback_pid;
++}
++
++static DWORD lookup_udp6_owner_pid(const SocketAddress &src) {
++    ULONG size = 0;
++    ULONG status = GetExtendedUdpTable(nullptr, &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
++    if (status != ERROR_INSUFFICIENT_BUFFER || size == 0) {
++        return 0;
++    }
++
++    std::vector<uint8_t> buffer(size);
++    status = GetExtendedUdpTable(buffer.data(), &size, FALSE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
++    if (status != ERROR_SUCCESS) {
++        return 0;
++    }
++
++    const auto *table = (const MIB_UDP6TABLE_OWNER_PID *) buffer.data();
++    const DWORD src_port = network_port(src);
++    DWORD fallback_pid = 0;
++    bool fallback_ambiguous = false;
++
++    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
++        const MIB_UDP6ROW_OWNER_PID &row = table->table[i];
++        if (row.dwLocalPort != src_port) {
++            continue;
++        }
++
++        if (ipv6_matches(row.ucLocalAddr, src)) {
++            return row.dwOwningPid;
++        }
++
++        if (ipv6_is_any(row.ucLocalAddr)) {
++            fallback_pid = unique_pid_or_ambiguous(fallback_pid, fallback_ambiguous, row.dwOwningPid);
++        }
++    }
++
++    return fallback_ambiguous ? 0 : fallback_pid;
++}
++
++static DWORD lookup_owner_pid(int proto, const SocketAddress &src, const SocketAddress &dst) {
++    if (proto == IPPROTO_TCP) {
++        if (is_ipv4(src) && is_ipv4(dst)) {
++            return lookup_tcp4_owner_pid(src, dst);
++        }
++
++        if (is_ipv6(src) && is_ipv6(dst)) {
++            return lookup_tcp6_owner_pid(src, dst);
++        }
++    }
++
++    if (proto == IPPROTO_UDP) {
++        if (is_ipv4(src)) {
++            return lookup_udp4_owner_pid(src);
++        }
++
++        if (is_ipv6(src)) {
++            return lookup_udp6_owner_pid(src);
++        }
++    }
++
++    return 0;
++}
++
++#endif // _WIN32
++
++std::string tcpip_resolve_process_name(int proto, const SocketAddress &src, const SocketAddress &dst) {
++#ifdef _WIN32
++    return process_name_from_pid(lookup_owner_pid(proto, src, dst));
++#else
++    (void) proto;
++    (void) src;
++    (void) dst;
++    return {};
++#endif
++}
++
++} // namespace ag
+diff --git a/tcpip/src/process_resolver.h b/tcpip/src/process_resolver.h
+new file mode 100644
+index 0000000..6391b12
+--- /dev/null
++++ b/tcpip/src/process_resolver.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <string>
++
++#include "common/socket_address.h"
++
++namespace ag {
++
++std::string tcpip_resolve_process_name(int proto, const SocketAddress &src, const SocketAddress &dst);
++
++} // namespace ag
+diff --git a/tcpip/src/tcp_conn_manager.cpp b/tcpip/src/tcp_conn_manager.cpp
+index af10c23..6cb26aa 100644
+--- a/tcpip/src/tcp_conn_manager.cpp
++++ b/tcpip/src/tcp_conn_manager.cpp
+@@ -21,6 +21,7 @@
+ #include "common/logger.h"
+ #include "common/socket_address.h"
+ #include "tcp_conn_manager.h"
++#include "process_resolver.h"
+ #include "tcp_raw.h"
+ #include "tcpip/tcpip.h"
+ #include "tcpip_common.h"
+@@ -322,12 +323,14 @@ void tcp_cm_request_connection(TcpipCtx *ctx, TcpConnDescriptor *connection) {
+ 
+     SocketAddress src = ip_addr_to_socket_address(&common->addr.src_ip, common->addr.src_port);
+     SocketAddress dst = ip_addr_to_socket_address(&common->addr.dst_ip, common->addr.dst_port);
++    std::string app_name = tcpip_resolve_process_name(IPPROTO_TCP, src, dst);
+ 
+     TcpipConnectRequestEvent event = {
+             common->id,
+             IPPROTO_TCP,
+             &src,
+             &dst,
++            app_name.c_str(),
+     };
+ 
+     TcpipHandler *callbacks = &ctx->parameters.handler;
+diff --git a/tcpip/src/udp_conn_manager.cpp b/tcpip/src/udp_conn_manager.cpp
+index 499664a..d3ba5c4 100644
+--- a/tcpip/src/udp_conn_manager.cpp
++++ b/tcpip/src/udp_conn_manager.cpp
+@@ -18,6 +18,7 @@
+ 
+ #include "common/logger.h"
+ #include "common/socket_address.h"
++#include "process_resolver.h"
+ #include "tcpip_common.h"
+ #include "tcpip_util.h"
+ #include "udp_conn_manager.h"
+@@ -291,12 +292,14 @@ void udp_cm_request_connection(TcpipCtx *ctx, UdpConnDescriptor *connection) {
+ 
+     SocketAddress src = ip_addr_to_socket_address(&common->addr.src_ip, common->addr.src_port);
+     SocketAddress dst = ip_addr_to_socket_address(&common->addr.dst_ip, common->addr.dst_port);
++    std::string app_name = tcpip_resolve_process_name(IPPROTO_UDP, src, dst);
+ 
+     TcpipConnectRequestEvent event = {
+             common->id,
+             IPPROTO_UDP,
+             &src,
+             &dst,
++            app_name.c_str(),
+     };
+ 
+     TcpipHandler *callbacks = &ctx->parameters.handler;
+diff --git a/trusttunnel/README.md b/trusttunnel/README.md
+index 08e87df..907505a 100644
+--- a/trusttunnel/README.md
++++ b/trusttunnel/README.md
+@@ -164,6 +164,10 @@ The `exclusions` array supports the following formats:
+ - **CIDR range**: `192.168.0.0/16` or `2001:db8::/32`
+ - **Wildcard port**: `*:80` — matches any connection to the specified port regardless of destination address
+ 
++- **Application process**: `deadlock.exe`, `app:deadlock.exe`, or `process:deadlock.exe` - matches
++  connections initiated by that process name. Windows process matching is case-insensitive and also accepts
++  full paths by comparing only the executable basename.
++
+ ### DNS Upstreams Syntax
+ 
+ The `dns_upstreams` array supports the following formats:
+diff --git a/trusttunnel/setup_wizard/src/settings.rs b/trusttunnel/setup_wizard/src/settings.rs
+index e763564..ee0b320 100644
+--- a/trusttunnel/setup_wizard/src/settings.rs
++++ b/trusttunnel/setup_wizard/src/settings.rs
+@@ -111,6 +111,12 @@ Supported syntax:
+       * IPv4Address:port
+       * IPv4Address
+     * if port is not specified, any port will be matched
++  * application process
++    * recognized formats are:
++      * process.exe
++      * app:process.exe
++      * process:process.exe
++    * process matching is case-insensitive and compares executable basename
+   * CIDR range
+     * recognized formats are:
+       * IPv4Address/mask
+-- 
+2.52.0.windows.1
+

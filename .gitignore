@@ -1,0 +1,46 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+dist/
+publish/
+release/
+artifacts/
+TestResults/
+ui-previews/
+
+# IDE and OS files
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+Thumbs.db
+Desktop.ini
+
+# Logs, backups, and local runtime state
+*.log
+*.bak
+*.tmp
+*.trx
+coverage/
+coverage.*
+
+# Secrets and credentials
+*.pfx
+*.p12
+*.pem
+*.key
+id_ed25519
+id_ed25519.pub
+
+# Runtime binaries downloaded by scripts/download_deps.ps1.
+# Keep these out of git; release artifacts include them from the local client folder.
+client/*
+!client/.gitkeep
+!client/README.md
+
+# NuGet/package output
+*.nupkg
+*.snupkg

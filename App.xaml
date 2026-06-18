@@ -1,0 +1,8 @@
+<Application x:Class="Veil.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Application.Resources>
+        <SolidColorBrush x:Key="AccentBrush" Color="#2563EB" />
+        <SolidColorBrush x:Key="MutedBrush" Color="#64748B" />
+    </Application.Resources>
+</Application>

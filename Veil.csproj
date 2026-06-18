@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationIcon>Assets\app_icon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Product>Veil</Product>
+    <AssemblyTitle>Veil</AssemblyTitle>
+    <AssemblyName>Veil</AssemblyName>
+    <RootNamespace>Veil</RootNamespace>
+    <Version>0.1.0</Version>
+    <Authors>Veil contributors</Authors>
+    <Description>Windows WPF client for TrustTunnel VPN with split tunneling and server setup tools.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="SSH.NET" Version="2025.1.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Remove="Veil.Tests\**\*.cs" />
+    <None Remove="Veil.Tests\**\*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\icon.png" />
+    <Resource Include="Assets\logo.png" />
+    <Resource Include="Assets\Fonts\Manrope.ttf" />
+    <Content Include="Assets\app_icon.ico">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="Assets\tray_icon.ico">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Include="client\trusttunnel_client.exe" Condition="Exists('client\trusttunnel_client.exe')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+    <Content Include="client\wintun.dll" Condition="Exists('client\wintun.dll')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+</Project>
