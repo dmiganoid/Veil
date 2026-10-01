@@ -1,0 +1,21 @@
+<Window x:Class="Veil.Dialogs.TextPromptDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Style="{StaticResource DialogWindow}"
+        Title="Veil"
+        Width="420"
+        WindowStartupLocation="CenterOwner"
+        FocusManager.FocusedElement="{Binding ElementName=ValueTextBox}">
+    <StackPanel>
+        <StackPanel Margin="20,4,20,20">
+            <TextBlock x:Name="LabelText" Style="{StaticResource FieldLabel}" />
+            <TextBox x:Name="ValueTextBox" />
+        </StackPanel>
+        <Border Style="{StaticResource DialogFooter}">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button Content="Cancel" IsCancel="True" MinWidth="96" />
+                <Button x:Name="OkButton" Content="Save" IsDefault="True" MinWidth="96" Margin="8,0,0,0" Style="{StaticResource PrimaryButton}" Click="OkButton_Click" />
+            </StackPanel>
+        </Border>
+    </StackPanel>
+</Window>

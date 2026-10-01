@@ -8,10 +8,16 @@ namespace Veil.Services;
 
 public sealed class ServerSetupService : IDisposable
 {
+    internal const string EndpointVersion = "1.0.33";
+    internal static string InstallScriptUrl =>
+        $"https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/tags/v{EndpointVersion}/scripts/install.sh";
+
+    private const string EndpointPath = "/opt/trusttunnel/trusttunnel_endpoint";
     private readonly List<string> _logs = [];
     private readonly IServerSetupSshSessionFactory _sshSessionFactory;
     private IServerSetupSshSession? _sshSession;
     private ServerSetupConfig? _lastConfig;
+    private bool _existingServiceWasActive;
 
     public ServerSetupService()
         : this(new RenciServerSetupSshSessionFactory())
@@ -71,6 +77,7 @@ public sealed class ServerSetupService : IDisposable
         _logs.Clear();
         ErrorMessage = null;
         AlreadyInstalled = false;
+        _existingServiceWasActive = false;
         StateChanged?.Invoke(this, EventArgs.Empty);
 
         try
@@ -89,6 +96,11 @@ public sealed class ServerSetupService : IDisposable
         catch (Exception ex)
         {
             ErrorMessage = ex.Message;
+            if (_existingServiceWasActive)
+            {
+                await TryRestoreExistingServiceAsync();
+            }
+
             SetStep(SetupStep.Failed);
             AddLog($"Error: {ex.Message}");
         }
@@ -96,6 +108,41 @@ public sealed class ServerSetupService : IDisposable
         {
             Disconnect();
         }
+    }
+
+    private async Task TryRestoreExistingServiceAsync()
+    {
+        if (_sshSession == null || !_sshSession.IsConnected)
+        {
+            AddLog("Could not restart the previously installed service because SSH is disconnected.");
+            return;
+        }
+
+        AddLog("Installation failed after stopping the existing service; attempting to restart it...");
+        try
+        {
+            await RunCommandAsync("systemctl start trusttunnel");
+            var status = await RunCommandAsync("systemctl is-active trusttunnel");
+            if (!string.Equals(status.Trim(), "active", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException($"Service status is '{status}', expected 'active'.");
+            }
+
+            AddLog("Previously installed Veil service restarted successfully.");
+        }
+        catch (Exception recoveryError)
+        {
+            AddLog($"Warning: could not restart the previously installed Veil service: {recoveryError.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Extracts "1.0.33" from version output such as "trusttunnel_endpoint 1.0.33" or a bare "1.0.33".
+    /// </summary>
+    internal static string ParseEndpointVersion(string output)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(output, @"(?<![\d.])\d+\.\d+\.\d+(?![\d.])");
+        return match.Success ? match.Value : output.Trim();
     }
 
     public async Task ApplyToClientConfigAsync(ConfigService configService)
@@ -145,7 +192,7 @@ public sealed class ServerSetupService : IDisposable
 
         try
         {
-            await RunCommandAsync("test -f /opt/trusttunnel/trusttunnel_endpoint");
+            await RunCommandAsync($"test -f {EndpointPath}");
             AlreadyInstalled = true;
             AddLog("Veil server is already installed on this server.");
         }
@@ -168,6 +215,11 @@ public sealed class ServerSetupService : IDisposable
         AddLog($"Checking if port {config.ListenPort} is available...");
         if (AlreadyInstalled)
         {
+            var serviceState = await RunCommandAsync(
+                "systemctl show trusttunnel --property=ActiveState --value 2>/dev/null || true");
+            _existingServiceWasActive =
+                string.Equals(serviceState.Trim(), "active", StringComparison.Ordinal);
+            AddLog($"Existing service state before update: {serviceState}.");
             await RunCommandAsync("systemctl stop trusttunnel || true");
         }
 
@@ -215,10 +267,21 @@ public sealed class ServerSetupService : IDisposable
     private async Task StepInstallAsync()
     {
         SetStep(SetupStep.Installing);
-        AddLog("Downloading and installing Veil server (latest)...");
+        AddLog($"Downloading and installing Veil server ({EndpointVersion})...");
 
-        await RunCommandAsync("curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s -- -a y");
-        await RunCommandAsync("test -f /opt/trusttunnel/trusttunnel_endpoint");
+        await RunCommandAsync(
+            $"curl -fsSL {InstallScriptUrl} " +
+            $"| sh -s -- -a y -V {EndpointVersion}");
+        await RunCommandAsync($"test -f {EndpointPath}");
+        var versionOutput = await RunCommandAsync($"{EndpointPath} --version");
+        var installedVersion = ParseEndpointVersion(versionOutput);
+        if (!string.Equals(installedVersion, EndpointVersion, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Installed TrustTunnel endpoint version mismatch: expected {EndpointVersion}, got '{versionOutput}'.");
+        }
+
+        AddLog($"Verified TrustTunnel endpoint version {installedVersion}.");
         AddLog("Veil server installed to /opt/trusttunnel/.");
     }
 

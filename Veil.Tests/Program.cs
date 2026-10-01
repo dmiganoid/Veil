@@ -5,11 +5,14 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Win32;
 using Veil;
+using Veil.Dialogs;
 using Veil.Models;
 using Veil.Services;
 
@@ -28,8 +31,30 @@ public static class Program
         var tests = new (string Name, Func<Task> Run)[]
         {
             ("ServerConfig generates Veil TOML", TestServerConfigToml),
+            ("ServerConfig generates System Proxy TOML", TestServerConfigSystemProxyToml),
+            ("Windows System Proxy restores exact previous settings", TestWindowsSystemProxyRestoresExactSettings),
+            ("Windows System Proxy recovers stale crash state", TestWindowsSystemProxyRecoversStaleState),
+            ("Windows System Proxy preserves external ownership changes", TestWindowsSystemProxyPreservesExternalChanges),
             ("ServerConfig canonicalizes split-tunnel TOML exclusions", TestServerConfigCanonicalizesTomlExclusions),
-            ("ServerConfig emits resilient app process TOML aliases", TestServerConfigEmitsAppProcessAliases),
+            ("ServerConfig emits domain exceptions after the rules they override", TestServerConfigEmitsDomainExceptions),
+            ("ServerConfig skips malformed rules instead of splitting them", TestServerConfigSkipsMalformedRules),
+            ("SplitTunnelEntry validates routing rules", TestSplitTunnelEntryValidatesRules),
+            ("SplitTunnelEntry converts international domains to punycode", TestSplitTunnelEntryConvertsInternationalDomains),
+            ("SplitTunnelEntry accepts only domain patterns as exceptions", TestSplitTunnelEntryValidatesExceptions),
+            ("SplitTunnelEntry coverage follows engine matching", TestSplitTunnelEntryCoverage),
+            ("DomainGroupsData keeps rules and exceptions exclusive", TestDomainGroupsRulesAndExceptionsAreExclusive),
+            ("DomainGroupsData reports which rules an exception overrides", TestDomainGroupsReportsOverriddenRules),
+            ("ConfigService persists routing exceptions", TestConfigServicePersistsRoutingExceptions),
+            ("ConfigService imports and exports routing exceptions", TestConfigServiceImportsRoutingExceptions),
+            ("ConfigService loads legacy TV Gateway configs", TestConfigServiceLoadsLegacyTvGatewayConfig),
+            ("ConfigService round-trips window preferences", TestConfigServiceRoundTripsPreferences),
+            ("DomainGroupsData treats www. names like the engine", TestDomainGroupsCanonicalizeWww),
+            ("DomainGroupsData keeps !-prefixed exceptions and drops rules they replace", TestDomainGroupsNormalizesExceptionPrefixes),
+            ("ConfigService import writes domain groups before raising ConfigChanged", TestConfigServiceImportWritesGroupsBeforeNotifying),
+            ("ConfigService tolerates overlapping saves and reads", TestConfigServiceToleratesOverlappingSaves),
+            ("ServerSetupService parses endpoint version output", TestServerSetupParsesEndpointVersion),
+            ("ServerConfig emits one entry per app, keeping spaces", TestServerConfigEmitsOneEntryPerApp),
+            ("ServerConfig expands VMware Workstation to guest networking processes", TestServerConfigExpandsVmwareProcesses),
             ("ServerConfig emits GeoIP runtime CIDR exclusions", TestServerConfigEmitsGeoIpRuntimeCidrs),
             ("ServerConfig escapes Veil TOML strings", TestServerConfigEscapesTomlStrings),
             ("GeoIpService downloads and caches country CIDRs", TestGeoIpServiceDownloadsAndCachesCountryCidrs),
@@ -50,16 +75,16 @@ public static class Program
             ("ConfigService rejects malformed manual imports", TestConfigServiceRejectsMalformedImport),
             ("ConfigService saves split tunnel without validating client settings", TestConfigServiceSplitTunnelSavePreservesClientDraft),
             ("ConfigService exports passwordless draft configuration", TestPasswordlessConfigExport),
-            ("ConfigService save/load round-trips VPN mode and split tunnel lists", TestConfigServiceSaveLoadRoundTrip),
+            ("ConfigService save/load round-trips connection and split tunnel modes", TestConfigServiceSaveLoadRoundTrip),
             ("ConfigService normalizes persisted split-tunnel entries", TestConfigServiceNormalizesPersistedSplitTunnelEntries),
             ("ConfigService normalizes persisted GeoIP countries", TestConfigServiceNormalizesPersistedGeoIpCountries),
             ("ConfigService normalizes split-tunnel app paths", TestConfigServiceNormalizesSplitTunnelAppPaths),
             ("ConfigService normalizes saved apps without mutating caller config", TestConfigServiceSaveDoesNotMutateCallerConfig),
             ("ConfigService loads validated persisted connection config", TestConfigServiceLoadConnectionConfig),
-            ("MainWindow rejects invalid client port drafts", TestMainWindowRejectsInvalidClientPortDrafts),
-            ("MainWindow generates Flutter-style VPN passwords", TestMainWindowGeneratesFlutterStyleVpnPasswords),
-            ("MainWindow creates detached config drafts", TestMainWindowCreatesDetachedConfigDrafts),
-            ("MainWindow applies discovery dialog selections like Flutter", TestMainWindowAppliesDiscoveryDialogSelections),
+            ("ConnectionForm rejects invalid ports", TestConnectionFormRejectsInvalidPorts),
+            ("PasswordGenerator uses the Flutter alphabet", TestPasswordGeneratorUsesFlutterAlphabet),
+            ("ConnectionForm applies to a detached copy and keeps routing", TestConnectionFormAppliesToDetachedCopy),
+            ("DomainGroupsData applies discovery dialog choices like Flutter", TestDomainGroupsApplyDiscoveryChoices),
             ("ConfigService writes JSON files through temp replacement", TestConfigServiceAtomicJsonWrites),
             ("ConfigService exports JSON without recovery backup files", TestConfigServiceExportDoesNotCreateBackup),
             ("ConfigService restores persisted JSON from backups", TestConfigServiceRestoresFromBackup),
@@ -82,6 +107,10 @@ public static class Program
             ("ConfigService persists auto-selected server setup listen ports", TestConfigServicePersistsAutoSelectedServerSetupListenPort),
             ("ServerSetupService shell-quotes certificate arguments", TestServerSetupShellQuotesCertificateArguments),
             ("ServerSetupService falls back when certbot standalone port is busy", TestServerSetupCertbotPortBusyFallback),
+            ("ServerSetupService pins the automatic endpoint installation version", TestServerSetupPinsEndpointVersion),
+            ("ServerSetupService rejects an unexpected installed endpoint version", TestServerSetupRejectsUnexpectedEndpointVersion),
+            ("ServerSetupService preserves an inactive service after update failure", TestServerSetupPreservesInactiveServiceAfterUpdateFailure),
+            ("ServerSetupService tolerates a missing unit for an installed binary", TestServerSetupToleratesMissingUnitForInstalledBinary),
             ("SplitTunnelSuggestionService mirrors Flutter log suggestion filters", TestSplitTunnelSuggestionFilters),
             ("SplitTunnelEntry preserves IP and CIDR entries", TestSplitTunnelEntryNormalization),
             ("DomainDiscoveryService extracts related domains from HTML", TestDomainDiscoveryHtmlExtraction),
@@ -90,11 +119,14 @@ public static class Program
             ("InstalledAppService adds common apps and filters installers", TestInstalledAppServiceNormalizeForDisplay),
             ("InstalledAppService derives Flutter-style directory display names", TestInstalledAppServiceDirectoryDisplayNames),
             ("InstalledAppService parses Steam library folders", TestInstalledAppServiceParsesSteamLibraryFolders),
-            ("MainWindow normalizes manual split-tunnel app entries", TestMainWindowNormalizesManualAppEntries),
+            ("SplitTunnelEntry normalizes manual app entries", TestSplitTunnelEntryNormalizesManualAppEntries),
             ("VpnStartupErrorClassifier mirrors startup error hints", TestVpnStartupErrorClassifier),
             ("VpnService reports selected client directory when binary is missing", TestVpnServiceMissingClientBinaryMessage),
             ("VpnService reports selected client directory when Wintun is missing", TestVpnServiceMissingWintunMessage),
             ("VpnService writes config and launches client process", TestVpnServiceConnectWritesConfigAndLaunchesClient),
+            ("VpnService starts and restores System Proxy without Wintun", TestVpnServiceSystemProxyWithoutWintun),
+            ("VpnService restores System Proxy after spontaneous exit", TestVpnServiceSystemProxyRestoresAfterExit),
+            ("VpnService restores System Proxy when the client exits during proxy activation", TestVpnServiceSystemProxyRestoresDuringActivationExit),
             ("VpnService disposes connected client process after spontaneous exit", TestVpnServiceDisposesConnectedClientProcessAfterSpontaneousExit),
             ("VpnService disposes client process when start throws", TestVpnServiceDisposesClientProcessWhenStartThrows),
             ("VpnService preserves connect error after internal cleanup", TestVpnServicePreservesConnectErrorAfterInternalCleanup),
@@ -128,6 +160,8 @@ public static class Program
             }
         }
 
+        Console.WriteLine();
+        Console.WriteLine($"{tests.Length - failures} passed, {failures} failed.");
         if (failures > 0)
         {
             Environment.ExitCode = 1;
@@ -173,6 +207,205 @@ public static class Program
         AssertContains(toml, "\"example.com\"");
         AssertContains(toml, "\"api.example.com\"");
         AssertContains(toml, "\"chrome.exe\"");
+        AssertContains(toml, "killswitch_enabled = true");
+        AssertContains(toml, "[listener.tun]");
+        Assert(!toml.Contains("[listener.socks]", StringComparison.Ordinal), "Full Tunnel config must not create a SOCKS listener.");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestServerConfigSystemProxyToml()
+    {
+        var config = new ServerConfig
+        {
+            Hostname = "vpn.example.com",
+            Address = "203.0.113.10",
+            Username = "alice",
+            Password = "secret",
+            ConnectionMode = VpnConnectionMode.SystemProxy,
+            VpnMode = VpnMode.Selective,
+            SplitTunnelDomains = ["example.com"],
+            SplitTunnelApps = ["chrome.exe"]
+        };
+
+        var toml = config.ToToml(["198.51.100.0/24"]);
+
+        AssertContains(toml, "vpn_mode = \"general\"");
+        AssertContains(toml, "killswitch_enabled = false");
+        AssertContains(toml, "exclusions = []");
+        AssertContains(toml, "[listener.socks]");
+        AssertContains(toml, $"address = \"127.0.0.1:{ServerConfig.SystemProxySocksPort}\"");
+        Assert(!toml.Contains("[listener.tun]", StringComparison.Ordinal), "System Proxy config must not create a TUN listener.");
+        Assert(!toml.Contains("\"example.com\"", StringComparison.Ordinal), "TUN split-domain rules must not leak into System Proxy mode.");
+        Assert(!toml.Contains("\"chrome.exe\"", StringComparison.Ordinal), "TUN app rules must not leak into System Proxy mode.");
+        Assert(!toml.Contains("\"198.51.100.0/24\"", StringComparison.Ordinal), "Runtime GeoIP rules must not leak into System Proxy mode.");
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestWindowsSystemProxyRestoresExactSettings()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return Task.CompletedTask;
+        }
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        var registryRoot = $@"Software\Veil.Tests.{Guid.NewGuid():N}";
+        var registryPath = $@"{registryRoot}\InternetSettings";
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            using (var key = Registry.CurrentUser.CreateSubKey(registryPath))
+            {
+                key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
+                key.SetValue("ProxyServer", "http=old.proxy:8080", RegistryValueKind.String);
+                key.SetValue("ProxyOverride", "internal.example", RegistryValueKind.String);
+                key.SetValue("AutoConfigURL", "https://old.example/proxy.pac", RegistryValueKind.String);
+            }
+
+            using var manager = new WindowsSystemProxyManager(
+                tempDir,
+                registryPath,
+                notifySettingsChanges: false);
+            manager.EnableSocksProxy(ServerConfig.SystemProxySocksPort);
+
+            using (var key = Registry.CurrentUser.OpenSubKey(registryPath))
+            {
+                Assert(Convert.ToInt32(key?.GetValue("ProxyEnable")) == 1, "System Proxy should enable the Windows proxy flag.");
+                Assert(
+                    string.Equals(
+                        key?.GetValue("ProxyServer")?.ToString(),
+                        $"socks=socks5://127.0.0.1:{ServerConfig.SystemProxySocksPort}",
+                        StringComparison.Ordinal),
+                    "System Proxy should explicitly select the local TrustTunnel SOCKS5 listener.");
+                Assert(
+                    key?.GetValue("ProxyOverride")?.ToString()?.Contains("<local>", StringComparison.OrdinalIgnoreCase) == true,
+                    "System Proxy should bypass local hosts.");
+                Assert(key?.GetValue("AutoConfigURL") == null, "System Proxy should temporarily disable a conflicting PAC URL.");
+            }
+
+            manager.Restore();
+
+            using (var key = Registry.CurrentUser.OpenSubKey(registryPath))
+            {
+                Assert(Convert.ToInt32(key?.GetValue("ProxyEnable")) == 0, "Restore should recover the previous proxy-enabled flag.");
+                Assert(key?.GetValue("ProxyServer")?.ToString() == "http=old.proxy:8080", "Restore should recover the previous proxy server.");
+                Assert(key?.GetValue("ProxyOverride")?.ToString() == "internal.example", "Restore should recover the previous bypass list.");
+                Assert(key?.GetValue("AutoConfigURL")?.ToString() == "https://old.example/proxy.pac", "Restore should recover the previous PAC URL.");
+            }
+
+            Assert(
+                !File.Exists(Path.Combine(tempDir, "system_proxy_state.json")),
+                "Successful restore should delete the crash-recovery state file.");
+        }
+        finally
+        {
+            Registry.CurrentUser.DeleteSubKeyTree(registryRoot, throwOnMissingSubKey: false);
+            Directory.Delete(tempDir, recursive: true);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestWindowsSystemProxyRecoversStaleState()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return Task.CompletedTask;
+        }
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        var registryRoot = $@"Software\Veil.Tests.{Guid.NewGuid():N}";
+        var registryPath = $@"{registryRoot}\InternetSettings";
+        Directory.CreateDirectory(tempDir);
+        WindowsSystemProxyManager? crashedManager = null;
+
+        try
+        {
+            using (var key = Registry.CurrentUser.CreateSubKey(registryPath))
+            {
+                key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
+                key.SetValue("ProxyServer", "direct-before-crash", RegistryValueKind.String);
+            }
+
+            crashedManager = new WindowsSystemProxyManager(
+                tempDir,
+                registryPath,
+                notifySettingsChanges: false);
+            crashedManager.EnableSocksProxy(ServerConfig.SystemProxySocksPort);
+
+            using var restartedManager = new WindowsSystemProxyManager(
+                tempDir,
+                registryPath,
+                notifySettingsChanges: false);
+            restartedManager.RecoverStaleState();
+
+            using var restoredKey = Registry.CurrentUser.OpenSubKey(registryPath);
+            Assert(Convert.ToInt32(restoredKey?.GetValue("ProxyEnable")) == 0, "Stale recovery should restore the pre-crash enable flag.");
+            Assert(restoredKey?.GetValue("ProxyServer")?.ToString() == "direct-before-crash", "Stale recovery should restore the pre-crash proxy value.");
+            Assert(
+                !File.Exists(Path.Combine(tempDir, "system_proxy_state.json")),
+                "Stale recovery should remove the consumed recovery state file.");
+        }
+        finally
+        {
+            crashedManager?.Dispose();
+            Registry.CurrentUser.DeleteSubKeyTree(registryRoot, throwOnMissingSubKey: false);
+            Directory.Delete(tempDir, recursive: true);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestWindowsSystemProxyPreservesExternalChanges()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return Task.CompletedTask;
+        }
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        var registryRoot = $@"Software\Veil.Tests.{Guid.NewGuid():N}";
+        var registryPath = $@"{registryRoot}\InternetSettings";
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            using (var key = Registry.CurrentUser.CreateSubKey(registryPath))
+            {
+                key.SetValue("ProxyEnable", 0, RegistryValueKind.DWord);
+            }
+
+            using var manager = new WindowsSystemProxyManager(
+                tempDir,
+                registryPath,
+                notifySettingsChanges: false);
+            manager.EnableSocksProxy(ServerConfig.SystemProxySocksPort);
+
+            using (var key = Registry.CurrentUser.OpenSubKey(registryPath, writable: true))
+            {
+                key?.SetValue("ProxyServer", "http=external.proxy:3128", RegistryValueKind.String);
+                key?.SetValue("ProxyEnable", 1, RegistryValueKind.DWord);
+            }
+
+            manager.Restore();
+
+            using var preservedKey = Registry.CurrentUser.OpenSubKey(registryPath);
+            Assert(
+                preservedKey?.GetValue("ProxyServer")?.ToString() == "http=external.proxy:3128",
+                "Veil must not overwrite proxy settings taken over by another application.");
+            Assert(Convert.ToInt32(preservedKey?.GetValue("ProxyEnable")) == 1, "External proxy ownership should preserve its enable flag.");
+            Assert(
+                !File.Exists(Path.Combine(tempDir, "system_proxy_state.json")),
+                "Ownership handoff should discard Veil's stale recovery state.");
+        }
+        finally
+        {
+            Registry.CurrentUser.DeleteSubKeyTree(registryRoot, throwOnMissingSubKey: false);
+            Directory.Delete(tempDir, recursive: true);
+        }
 
         return Task.CompletedTask;
     }
@@ -213,7 +446,7 @@ public static class Program
         return Task.CompletedTask;
     }
 
-    private static Task TestServerConfigEmitsAppProcessAliases()
+    private static Task TestServerConfigEmitsOneEntryPerApp()
     {
         var config = new ServerConfig
         {
@@ -225,25 +458,48 @@ public static class Program
             [
                 "Deadlock.exe",
                 "deadlock.EXE",
-                @"D:\Steam\steam.exe"
+                @"D:\Steam\steam.exe",
+                @"D:\Games\Hollow Knight\Hollow Knight.exe"
             ]
         };
 
-        var toml = config.ToToml();
+        var exclusions = config.BuildTomlExclusions();
 
-        AssertContains(toml, "\"Deadlock.exe\"");
-        AssertContains(toml, "\"Deadlock\"");
-        AssertContains(toml, "\"deadlock.exe\"");
-        AssertContains(toml, "\"deadlock\"");
-        AssertContains(toml, "\"steam.exe\"");
-        AssertContains(toml, "\"steam\"");
-        AssertContains(toml, "\"steamwebhelper.exe\"");
-        AssertContains(toml, "\"gameoverlayui64.exe\"");
-        AssertContains(toml, "\"valve.net\"");
-        AssertContains(toml, "\"*.valve.net\"");
-        AssertContains(toml, "\"steamserver.net\"");
-        AssertContains(toml, "\"*.steampowered.com\"");
-        Assert(toml.IndexOf("\"Deadlock.exe\"", StringComparison.Ordinal) == toml.LastIndexOf("\"Deadlock.exe\"", StringComparison.Ordinal), "Duplicate app process entries should still collapse before alias expansion.");
+        Assert(exclusions.Count(item => item.Equals("deadlock.exe", StringComparison.OrdinalIgnoreCase)) == 1, "Case variants of one app should collapse into one entry.");
+        Assert(exclusions.Contains("Hollow Knight.exe"), "App names with spaces must stay one entry; VeilEngine reads one exclusion per line.");
+        Assert(!exclusions.Contains("Deadlock") && !exclusions.Contains("steam") && !exclusions.Contains("Hollow Knight"),
+            "Names without .exe would be parsed by the engine as domain rules.");
+        foreach (var expected in new[] { "steam.exe", "steamwebhelper.exe", "gameoverlayui64.exe", "valve.net", "*.valve.net", "steamserver.net", "*.steampowered.com" })
+        {
+            Assert(exclusions.Contains(expected), $"Steam games should also route {expected}.");
+        }
+
+        Assert(exclusions.Count(item => item.Equals("steam.exe", StringComparison.OrdinalIgnoreCase)) == 1, "Steam companions should not duplicate a selected steam.exe.");
+        AssertContains(config.ToToml(), "\"Hollow Knight.exe\"");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestServerConfigExpandsVmwareProcesses()
+    {
+        var config = new ServerConfig
+        {
+            Hostname = "vpn.example.com",
+            Address = "203.0.113.10",
+            Username = "alice",
+            Password = "secret",
+            SplitTunnelApps = [@"C:\Program Files (x86)\VMware\VMware Workstation\vmware.exe"]
+        };
+
+        var exclusions = config.BuildTomlExclusions();
+
+        Assert(exclusions.Contains("vmware.exe"), "VMware Workstation launcher should remain excluded.");
+        Assert(exclusions.Contains("vmware-vmx.exe"), "VMware VM process should be excluded with Workstation.");
+        Assert(exclusions.Contains("vmnat.exe"), "VMware NAT service should be excluded with Workstation.");
+        Assert(exclusions.Contains("vmnetdhcp.exe"), "VMware network service should be excluded with Workstation.");
+        Assert(exclusions.Contains("vmplayer.exe"), "VMware Player should share Workstation's process family.");
+        Assert(
+            exclusions.Count(item => item.Equals("vmnat.exe", StringComparison.OrdinalIgnoreCase)) == 1,
+            "VMware companion processes should not be duplicated.");
         return Task.CompletedTask;
     }
 
@@ -268,7 +524,7 @@ public static class Program
         AssertContains(toml, "\"2001:db8::/32\"");
         AssertContains(toml, "\"chrome.exe\"");
         Assert(!toml.Contains("\"US\"", StringComparison.Ordinal), "GeoIP country codes should not be written directly to engine TOML.");
-        Assert(exclusions.SequenceEqual(["example.com", "203.0.113.0/24", "2001:db8::/32", "chrome.exe", "chrome"]), "Runtime CIDR exclusions should be normalized, deduped, and ordered before app aliases.");
+        Assert(exclusions.SequenceEqual(["example.com", "203.0.113.0/24", "2001:db8::/32", "chrome.exe"]), "Runtime CIDR exclusions should be normalized, deduped, and ordered before apps.");
         return Task.CompletedTask;
     }
 
@@ -1094,6 +1350,7 @@ public static class Program
                 Address = "203.0.113.10",
                 Username = "alice",
                 Password = "secret",
+                ConnectionMode = VpnConnectionMode.SystemProxy,
                 VpnMode = VpnMode.General,
                 SplitTunnelDomains = ["example.com", "cdn.example.com"],
                 SplitTunnelApps = ["chrome.exe", "steam.exe"],
@@ -1103,6 +1360,7 @@ public static class Program
             await service.SaveConfigAsync(config);
             var loaded = await service.LoadConfigAsync();
 
+            Assert(loaded.ConnectionMode == VpnConnectionMode.SystemProxy, "Connection mode should remain System Proxy after save/load.");
             Assert(loaded.VpnMode == VpnMode.General, "VPN mode should remain general after save/load.");
             Assert(loaded.SplitTunnelDomains.SequenceEqual(config.SplitTunnelDomains), "Domain list changed after save/load.");
             Assert(loaded.SplitTunnelApps.SequenceEqual(config.SplitTunnelApps), "App list changed after save/load.");
@@ -1369,43 +1627,41 @@ public static class Program
         }
     }
 
-    private static async Task TestMainWindowRejectsInvalidClientPortDrafts()
+    private static async Task TestConnectionFormRejectsInvalidPorts()
     {
-        Assert(MainWindow.ParseClientPort("1") == 1, "Minimum valid client port should parse.");
-        Assert(MainWindow.ParseClientPort("65535") == 65535, "Maximum valid client port should parse.");
-        Assert(MainWindow.ParseClientPort(" 8443 ") == 8443, "Client port parser should trim whitespace.");
+        Assert(ConnectionForm.ParsePort("1") == 1, "Minimum valid client port should parse.");
+        Assert(ConnectionForm.ParsePort("65535") == 65535, "Maximum valid client port should parse.");
+        Assert(ConnectionForm.ParsePort(" 8443 ") == 8443, "Client port parser should trim whitespace.");
 
-        var zero = await AssertThrowsAsync<InvalidOperationException>(() =>
-            Task.FromResult(MainWindow.ParseClientPort("0")));
-        Assert(zero.Message == "Invalid port.", "Port 0 should be rejected instead of silently falling back.");
-
-        var tooHigh = await AssertThrowsAsync<InvalidOperationException>(() =>
-            Task.FromResult(MainWindow.ParseClientPort("65536")));
-        Assert(tooHigh.Message == "Invalid port.", "Port above 65535 should be rejected instead of silently falling back.");
-
-        var notNumeric = await AssertThrowsAsync<InvalidOperationException>(() =>
-            Task.FromResult(MainWindow.ParseClientPort("not-a-port")));
-        Assert(notNumeric.Message == "Invalid port.", "Non-numeric client port should be rejected instead of silently falling back.");
+        foreach (var invalid in new[] { "0", "65536", "not-a-port", "" })
+        {
+            var error = await AssertThrowsAsync<InvalidOperationException>(() =>
+                Task.FromResult(ConnectionForm.ParsePort(invalid)));
+            Assert(error.Message.Contains("1 and 65535", StringComparison.Ordinal), $"Port '{invalid}' should be rejected with a helpful message.");
+        }
     }
 
-    private static Task TestMainWindowGeneratesFlutterStyleVpnPasswords()
+    private static Task TestPasswordGeneratorUsesFlutterAlphabet()
     {
-        Assert(MainWindow.GeneratedVpnPasswordLength == 16, "Generated VPN passwords should match Flutter's 16-character length.");
-        Assert(MainWindow.GeneratedVpnPasswordAlphabet == "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^&*", "Generated VPN password alphabet should match Flutter.");
+        Assert(PasswordGenerator.DefaultLength == 16, "Generated VPN passwords should match Flutter's 16-character length.");
+        Assert(PasswordGenerator.Alphabet == "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#%^&*", "Generated VPN password alphabet should match Flutter.");
 
+        var seen = new HashSet<string>();
         for (var i = 0; i < 32; i++)
         {
-            var password = MainWindow.GeneratePassword(MainWindow.GeneratedVpnPasswordLength);
-            Assert(password.Length == MainWindow.GeneratedVpnPasswordLength, "Generated VPN password length mismatch.");
-            Assert(password.All(MainWindow.GeneratedVpnPasswordAlphabet.Contains), "Generated VPN password contains a character outside the Flutter alphabet.");
+            var password = PasswordGenerator.Generate();
+            Assert(password.Length == PasswordGenerator.DefaultLength, "Generated VPN password length mismatch.");
+            Assert(password.All(PasswordGenerator.Alphabet.Contains), "Generated VPN password contains a character outside the Flutter alphabet.");
+            seen.Add(password);
         }
 
+        Assert(seen.Count == 32, "Generated VPN passwords should not repeat.");
         return Task.CompletedTask;
     }
 
-    private static Task TestMainWindowCreatesDetachedConfigDrafts()
+    private static Task TestConnectionFormAppliesToDetachedCopy()
     {
-        var current = new ServerConfig
+        var saved = new ServerConfig
         {
             Hostname = "saved.example.com",
             Address = "198.51.100.10",
@@ -1420,102 +1676,468 @@ public static class Program
             AntiDpi = false,
             PostQuantumGroupEnabled = true,
             CustomSni = "",
-            VpnMode = VpnMode.General,
+            ConnectionMode = VpnConnectionMode.FullTunnel,
+            VpnMode = VpnMode.Selective,
             SplitTunnelDomains = ["saved.example.com"],
+            SplitTunnelExceptions = ["keep.example.com"],
             SplitTunnelApps = [@"C:\Saved\App.exe"],
             SplitTunnelCountries = ["DE"]
         };
-        var domains = new List<string> { "group.example.com", "standalone.example.com" };
-        var apps = new List<string> { @"C:\Zulu\App.exe", @"C:\alpha\App.exe" };
-        var countries = new List<string> { " us ", "RU", "usa" };
 
-        var draft = MainWindow.CreateConfigDraft(
-            current,
+        var form = new ConnectionForm(
             " draft.example.com ",
             " 203.0.113.20 ",
-            8443,
+            " 8443 ",
             " draft-user ",
             "draft-secret",
             " 9.9.9.9 ",
-            "quic",
+            "http3",
             "debug",
-            false,
-            true,
-            true,
-            false,
             " sni.example.com ",
-            VpnMode.Selective,
-            domains,
-            apps,
-            countries);
+            HasIpv6: false,
+            SkipVerification: true,
+            AntiDpi: true,
+            PostQuantumGroupEnabled: false,
+            ConnectionMode: VpnConnectionMode.SystemProxy);
 
-        domains[0] = "mutated.example.com";
-        apps[0] = @"C:\Mutated\App.exe";
-        countries[0] = "JP";
+        var draft = form.ApplyTo(saved);
+        draft.SplitTunnelDomains.Add("mutated.example.com");
+        draft.SplitTunnelExceptions.Clear();
 
-        Assert(!ReferenceEquals(current, draft), "UI draft creation should return a detached config object.");
-        Assert(current.Hostname == "saved.example.com", "Creating a draft should not mutate the current hostname.");
-        Assert(current.Address == "198.51.100.10", "Creating a draft should not mutate the current address.");
-        Assert(current.Port == 443, "Creating a draft should not mutate the current port.");
-        Assert(current.SplitTunnelDomains.SequenceEqual(new[] { "saved.example.com" }), "Creating a draft should not mutate current split-tunnel domains.");
-        Assert(current.SplitTunnelApps.SequenceEqual(new[] { @"C:\Saved\App.exe" }), "Creating a draft should not mutate current split-tunnel apps.");
-        Assert(current.SplitTunnelCountries.SequenceEqual(new[] { "DE" }), "Creating a draft should not mutate current GeoIP countries.");
+        Assert(!ReferenceEquals(saved, draft), "Applying the form should return a detached config object.");
+        Assert(saved.Hostname == "saved.example.com" && saved.Port == 443, "Applying the form should not mutate the saved config.");
+        Assert(saved.SplitTunnelDomains.SequenceEqual(["saved.example.com"]), "Draft split-tunnel lists should be copies.");
+        Assert(saved.SplitTunnelExceptions.SequenceEqual(["keep.example.com"]), "Draft exception lists should be copies.");
         Assert(draft.Hostname == "draft.example.com", "Draft hostname should be trimmed.");
         Assert(draft.Address == "203.0.113.20", "Draft address should be trimmed.");
-        Assert(draft.Port == 8443, "Draft port should come from the parsed UI value.");
+        Assert(draft.Port == 8443, "Draft port should come from the parsed form value.");
         Assert(draft.Username == "draft-user", "Draft username should be trimmed.");
         Assert(draft.Password == "draft-secret", "Draft password should preserve the entered value.");
         Assert(draft.Dns == "9.9.9.9", "Draft DNS should be trimmed.");
-        Assert(draft.UpstreamProtocol == "quic", "Draft protocol should match the selected UI value.");
-        Assert(draft.LogLevel == "debug", "Draft log level should match the selected UI value.");
-        Assert(!draft.HasIpv6 && draft.SkipVerification && draft.AntiDpi && !draft.PostQuantumGroupEnabled, "Draft booleans should match the UI values.");
+        Assert(draft.UpstreamProtocol == "http3", "Draft protocol should match the form.");
+        Assert(draft.LogLevel == "debug", "Draft log level should match the form.");
+        Assert(!draft.HasIpv6 && draft.SkipVerification && draft.AntiDpi && !draft.PostQuantumGroupEnabled, "Draft booleans should match the form.");
         Assert(draft.CustomSni == "sni.example.com", "Draft custom SNI should be trimmed.");
-        Assert(draft.VpnMode == VpnMode.Selective, "Draft VPN mode should match the UI selection.");
-        Assert(draft.SplitTunnelDomains.SequenceEqual(new[] { "group.example.com", "standalone.example.com" }), "Draft split-tunnel domains should be copied in order.");
-        Assert(draft.SplitTunnelApps.SequenceEqual(new[] { @"C:\alpha\App.exe", @"C:\Zulu\App.exe" }), "Draft split-tunnel apps should be copied and sorted.");
-        Assert(draft.SplitTunnelCountries.SequenceEqual(["RU", "US"]), "Draft GeoIP countries should be copied and normalized.");
+        Assert(draft.ConnectionMode == VpnConnectionMode.SystemProxy, "Draft connection mode should match the form.");
+        Assert(draft.VpnMode == VpnMode.Selective, "The Connection page must keep the routing mode.");
+        Assert(draft.SplitTunnelApps.SequenceEqual([@"C:\Saved\App.exe"]) && draft.SplitTunnelCountries.SequenceEqual(["DE"]), "The Connection page must keep app and country rules.");
+
+        var roundTrip = ConnectionForm.FromConfig(saved).ApplyTo(saved);
+        Assert(roundTrip.Hostname == saved.Hostname && roundTrip.Port == saved.Port && roundTrip.Password == saved.Password, "A form built from a config should reproduce it.");
         return Task.CompletedTask;
     }
 
-    private static Task TestMainWindowAppliesDiscoveryDialogSelections()
+    private static Task TestDomainGroupsApplyDiscoveryChoices()
     {
         var canceledData = new DomainGroupsData();
-        var canceled = MainWindow.ApplyDiscoveryDialogResult(canceledData, "example.com", null);
-
-        Assert(!canceled, "Cancelled discovery dialog should not be treated as an applied selection.");
+        Assert(!canceledData.ApplyDiscoveryChoice("example.com", null), "Cancelled discovery dialog should not be treated as an applied selection.");
         Assert(canceledData.FlattenDomains().Count == 0, "Cancelled discovery dialog should not add the domain automatically.");
 
         var standaloneData = new DomainGroupsData();
-        var standalone = MainWindow.ApplyDiscoveryDialogResult(
-            standaloneData,
-            "example.com",
-            new MainWindow.DiscoveryDialogResult(false, "", []));
-
-        Assert(standalone, "Standalone discovery selection should be applied.");
+        Assert(standaloneData.ApplyDiscoveryChoice("example.com", new DomainDiscoveryChoice(false, "", [])), "Standalone discovery selection should be applied.");
         Assert(standaloneData.Groups.Count == 0, "Standalone discovery selection should not create a group.");
         Assert(standaloneData.StandaloneDomains.SequenceEqual(["example.com"]), "Standalone discovery selection should add the primary domain.");
 
         var groupedData = new DomainGroupsData();
-        var grouped = MainWindow.ApplyDiscoveryDialogResult(
-            groupedData,
-            "shop.example.com",
-            new MainWindow.DiscoveryDialogResult(true, "Shop", ["cdn.example.net"]));
-
-        Assert(grouped, "Grouped discovery selection should be applied.");
+        Assert(groupedData.ApplyDiscoveryChoice("shop.example.com", new DomainDiscoveryChoice(true, "Shop", ["cdn.example.net"])), "Grouped discovery selection should be applied.");
         Assert(groupedData.Groups.Count == 1, "Grouped discovery selection should create a group.");
         Assert(groupedData.Groups[0].Name == "Shop", "Discovery group name should come from the dialog.");
         Assert(groupedData.Groups[0].Domains.SequenceEqual(["shop.example.com", "cdn.example.net"]), "Discovery group should include the primary domain and selected related domains.");
 
         var emptySelectionData = new DomainGroupsData();
-        var emptySelection = MainWindow.ApplyDiscoveryDialogResult(
-            emptySelectionData,
-            "media.example.org",
-            new MainWindow.DiscoveryDialogResult(true, "Media", []));
-
-        Assert(emptySelection, "Empty grouped discovery selection should still be applied.");
+        Assert(emptySelectionData.ApplyDiscoveryChoice("media.example.org", new DomainDiscoveryChoice(true, "Media", [])), "Empty grouped discovery selection should still be applied.");
         Assert(emptySelectionData.Groups.Count == 0, "Empty grouped discovery selection should fall back to standalone, matching Flutter.");
         Assert(emptySelectionData.StandaloneDomains.SequenceEqual(["media.example.org"]), "Empty grouped discovery selection should add the primary domain standalone.");
 
+        Assert(DomainDiscoveryDialog.BuildDefaultGroupName("youtube.com") == "Youtube", "Default group names should come from the first label.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestServerConfigEmitsDomainExceptions()
+    {
+        var config = new ServerConfig
+        {
+            Hostname = "vpn.example.com",
+            Address = "203.0.113.10",
+            Username = "alice",
+            Password = "secret",
+            VpnMode = VpnMode.General,
+            SplitTunnelDomains = ["*.net", "example.org"],
+            SplitTunnelExceptions = [" Example.NET ", "!*.keep.net", "203.0.113.0/24", "example.net"]
+        };
+
+        var exclusions = config.BuildTomlExclusions(["198.51.100.0/24"]);
+
+        Assert(exclusions.SequenceEqual(["*.net", "example.org", "198.51.100.0/24", "!example.net", "!*.keep.net"]),
+            $"Unexpected exclusions: {string.Join(", ", exclusions)}");
+
+        var toml = config.ToToml();
+        AssertContains(toml, "\"!example.net\"");
+        AssertContains(toml, "\"!*.keep.net\"");
+        Assert(!toml.Contains("!203.0.113.0/24", StringComparison.Ordinal), "IP ranges cannot be exceptions and must not reach the engine.");
+
+        config.ConnectionMode = VpnConnectionMode.SystemProxy;
+        Assert(!config.ToToml().Contains("!example.net", StringComparison.Ordinal), "System Proxy mode must not emit routing exceptions.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestServerConfigSkipsMalformedRules()
+    {
+        var config = new ServerConfig
+        {
+            Hostname = "vpn.example.com",
+            Address = "203.0.113.10",
+            Username = "alice",
+            Password = "secret",
+            SplitTunnelDomains = ["good.example.com", "two words.com", "bad\"quote.com", "*.*.net", "*.fine.org"]
+        };
+
+        var exclusions = config.BuildTomlExclusions();
+
+        Assert(exclusions.SequenceEqual(["good.example.com", "*.fine.org"]),
+            $"Malformed rules must be skipped because the engine splits entries on whitespace: {string.Join(", ", exclusions)}");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSplitTunnelEntryValidatesRules()
+    {
+        var valid = new (string Input, string Expected, SplitTunnelEntryKind Kind)[]
+        {
+            ("Example.COM", "example.com", SplitTunnelEntryKind.Domain),
+            ("https://www.Example.com/watch?v=1", "example.com", SplitTunnelEntryKind.Domain),
+            ("www.example.com", "example.com", SplitTunnelEntryKind.Domain),
+            ("www.com", "www.com", SplitTunnelEntryKind.Domain),
+            ("*.www.example.com", "*.www.example.com", SplitTunnelEntryKind.WildcardDomain),
+            ("example.com.", "example.com", SplitTunnelEntryKind.Domain),
+            ("*.net", "*.net", SplitTunnelEntryKind.WildcardDomain),
+            ("*.Example.com", "*.example.com", SplitTunnelEntryKind.WildcardDomain),
+            ("_srv.example.com", "_srv.example.com", SplitTunnelEntryKind.Domain),
+            ("203.0.113.7", "203.0.113.7", SplitTunnelEntryKind.IpAddress),
+            ("203.0.113.7:443", "203.0.113.7:443", SplitTunnelEntryKind.IpAddress),
+            ("2001:db8::1", "2001:db8::1", SplitTunnelEntryKind.IpAddress),
+            ("[2001:db8::1]:443", "[2001:db8::1]:443", SplitTunnelEntryKind.IpAddress),
+            ("203.0.113.0/24", "203.0.113.0/24", SplitTunnelEntryKind.Cidr),
+            ("2001:DB8::/32", "2001:db8::/32", SplitTunnelEntryKind.Cidr),
+            ("*:8080", "*:8080", SplitTunnelEntryKind.Port)
+        };
+
+        foreach (var (input, expected, kind) in valid)
+        {
+            Assert(SplitTunnelEntry.TryNormalizeRule(input, out var normalized, out var actualKind), $"'{input}' should be a valid rule.");
+            Assert(normalized == expected, $"'{input}' should normalize to '{expected}', got '{normalized}'.");
+            Assert(actualKind == kind, $"'{input}' should be {kind}, got {actualKind}.");
+        }
+
+        foreach (var input in new[] { "", "   ", "two words.com", "*.*.net", "*.", ".net", "exa$mple.com", "*:0", "*:70000", "203.0.113.0/33", "-bad.example.com", "10", "1.2.3", "300.1.1.1", "010.0.0.1", "0x7f.0.0.1", "*.10" })
+        {
+            Assert(!SplitTunnelEntry.TryNormalizeRule(input, out _, out _), $"'{input}' should be rejected.");
+        }
+
+        Assert(SplitTunnelEntry.ShouldDiscoverRelatedDomains("example.com"), "Plain domains should offer related-domain discovery.");
+        Assert(!SplitTunnelEntry.ShouldDiscoverRelatedDomains("*.example.com"), "Wildcards cannot be fetched for related domains.");
+        Assert(!SplitTunnelEntry.ShouldDiscoverRelatedDomains("203.0.113.7"), "IP addresses should not trigger related-domain discovery.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSplitTunnelEntryConvertsInternationalDomains()
+    {
+        Assert(SplitTunnelEntry.TryNormalizeRule("Пример.РФ", out var domain, out var kind) && kind == SplitTunnelEntryKind.Domain,
+            "Cyrillic domains should be accepted.");
+        Assert(domain == "xn--e1afmkfd.xn--p1ai", $"Cyrillic domains should become punycode, got '{domain}'.");
+        Assert(SplitTunnelEntry.TryNormalizeRule("*.рф", out var wildcard, out kind) && kind == SplitTunnelEntryKind.WildcardDomain,
+            "Cyrillic wildcards should be accepted.");
+        Assert(wildcard == "*.xn--p1ai", $"Cyrillic wildcards should become punycode, got '{wildcard}'.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSplitTunnelEntryValidatesExceptions()
+    {
+        Assert(SplitTunnelEntry.TryNormalizeException("!Example.net", out var exception) && exception == "example.net",
+            "A leading ! should be accepted and stripped.");
+        Assert(SplitTunnelEntry.TryNormalizeException("*.cdn.example.net", out var wildcard) && wildcard == "*.cdn.example.net",
+            "Wildcard exceptions should be accepted.");
+        foreach (var input in new[] { "203.0.113.7", "203.0.113.0/24", "*:443", "!!example.net", "two words" })
+        {
+            Assert(!SplitTunnelEntry.TryNormalizeException(input, out _), $"'{input}' should not be a valid exception.");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static Task TestSplitTunnelEntryCoverage()
+    {
+        Assert(SplitTunnelEntry.Covers("*.net", "example.net"), "*.net covers example.net.");
+        Assert(SplitTunnelEntry.Covers("*.net", "*.cdn.example.net"), "*.net covers deeper wildcards.");
+        Assert(SplitTunnelEntry.Covers("example.net", "example.net"), "A rule covers itself.");
+        Assert(!SplitTunnelEntry.Covers("example.net", "sub.example.net"), "A plain domain rule does not cover subdomains.");
+        Assert(!SplitTunnelEntry.Covers("*.example.net", "example.net"), "A wildcard does not cover its bare domain, matching the engine.");
+        Assert(!SplitTunnelEntry.Covers("*.net", "example.org"), "Unrelated zones are not covered.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestDomainGroupsRulesAndExceptionsAreExclusive()
+    {
+        var data = new DomainGroupsData();
+        Assert(data.AddStandaloneDomain("example.net"), "Rule should be added.");
+        Assert(data.AddException("Example.NET"), "Adding an exception for the same pattern should succeed.");
+        Assert(!data.ContainsDomain("example.net"), "An exception replaces the rule for the same pattern.");
+        Assert(data.ExceptionDomains.SequenceEqual(["example.net"]), "The exception should be normalized.");
+        Assert(!data.AddException("example.net"), "Duplicate exceptions should be ignored.");
+
+        Assert(data.AddStandaloneDomain("example.net"), "Turning the exception back into a rule should succeed.");
+        Assert(!data.ContainsException("example.net"), "A rule replaces the exception for the same pattern.");
+
+        data.ExceptionDomains.Add("203.0.113.0/24");
+        data.ExceptionDomains.Add(" *.Keep.net ");
+        var normalized = data.NormalizeEntries();
+        Assert(normalized.ExceptionDomains.SequenceEqual(["*.keep.net"]), "Normalization keeps only domain exceptions.");
+        Assert(normalized.Version == DomainGroupsData.CurrentVersion, "Normalization should stamp the current version.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestDomainGroupsReportsOverriddenRules()
+    {
+        var data = new DomainGroupsData();
+        data.AddStandaloneDomain("*.net");
+        data.AddGroup("Example", "example.net", ["*.example.net"]);
+        data.AddException("cdn.example.net");
+        data.AddException("unrelated.org");
+
+        Assert(data.RulesOverriddenBy("cdn.example.net").SequenceEqual(["*.example.net", "*.net"]),
+            $"Unexpected overridden rules: {string.Join(", ", data.RulesOverriddenBy("cdn.example.net"))}");
+        Assert(data.RulesOverriddenBy("unrelated.org").Count == 0, "An exception without a broader rule overrides nothing.");
+        Assert(data.FlattenExceptions().SequenceEqual(["cdn.example.net", "unrelated.org"]), "Exceptions should flatten in insertion order.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestConfigServicePersistsRoutingExceptions()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var service = new ConfigService(tempDir);
+            var rules = new DomainGroupsData();
+            rules.AddStandaloneDomain("*.net");
+            rules.AddException("example.net");
+
+            var saved = await service.SaveSplitTunnelStateAsync(rules, VpnMode.General, ["game.exe"], ["DE"]);
+            Assert(saved.SplitTunnelDomains.SequenceEqual(["*.net"]), "Saved config should contain the rule.");
+            Assert(saved.SplitTunnelExceptions.SequenceEqual(["example.net"]), "Saved config should contain the exception.");
+
+            var groupsJson = await File.ReadAllTextAsync(Path.Combine(tempDir, "domain_groups.json"));
+            AssertContains(groupsJson, "\"exceptionDomains\"");
+
+            var reloadedConfig = await service.LoadConfigAsync();
+            var reloadedRules = await service.LoadDomainGroupsAsync();
+            Assert(reloadedConfig.SplitTunnelExceptions.SequenceEqual(["example.net"]), "Exceptions should survive reloading config.json.");
+            Assert(reloadedRules.ExceptionDomains.SequenceEqual(["example.net"]), "Exceptions should survive reloading domain_groups.json.");
+            AssertContains(reloadedConfig.ToToml(), "\"!example.net\"");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static async Task TestConfigServiceImportsRoutingExceptions()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var importPath = Path.Combine(tempDir, "import.json");
+            await File.WriteAllTextAsync(importPath, """
+                {
+                  "hostname": "vpn.example.com",
+                  "address": "203.0.113.10",
+                  "username": "alice",
+                  "password": "secret",
+                  "vpnMode": "general",
+                  "splitTunnelDomains": ["*.net"],
+                  "splitTunnelExceptions": ["example.net", "203.0.113.0/24"]
+                }
+                """);
+
+            var service = new ConfigService(Path.Combine(tempDir, "appdata"));
+            var imported = await service.ImportConfigAndPersistAsync(importPath);
+            var rules = await service.LoadDomainGroupsAsync();
+
+            Assert(imported.SplitTunnelExceptions.SequenceEqual(["example.net"]), "Only domain exceptions should be imported.");
+            Assert(rules.ExceptionDomains.SequenceEqual(["example.net"]), "Imported exceptions should appear on the Routing page.");
+
+            var exportPath = Path.Combine(tempDir, "export.json");
+            await service.ExportConfigAsync(imported, exportPath);
+            AssertContains(await File.ReadAllTextAsync(exportPath), "\"splitTunnelExceptions\"");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static async Task TestConfigServiceLoadsLegacyTvGatewayConfig()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(tempDir, "config.json"), """
+                {
+                  "hostname": "vpn.example.com",
+                  "address": "203.0.113.10",
+                  "username": "alice",
+                  "password": "secret",
+                  "connectionMode": "fullTunnel",
+                  "tvGatewayEnabled": true,
+                  "vpnMode": "general",
+                  "splitTunnelDomains": ["example.com"]
+                }
+                """);
+            await File.WriteAllTextAsync(Path.Combine(tempDir, "domain_groups.json"), """
+                { "version": 1, "groups": [], "standaloneDomains": ["example.com"] }
+                """);
+
+            var service = new ConfigService(tempDir);
+            var config = await service.LoadConnectionConfigAsync();
+            var rules = await service.LoadDomainGroupsAsync();
+            Assert(config.Hostname == "vpn.example.com" && config.SplitTunnelDomains.SequenceEqual(["example.com"]), "Configs written by the TV Gateway build should still load.");
+            Assert(rules.StandaloneDomains.SequenceEqual(["example.com"]) && rules.ExceptionDomains.Count == 0, "Version 1 domain groups should load without exceptions.");
+
+            await service.SaveConfigAsync(config);
+            var json = await File.ReadAllTextAsync(Path.Combine(tempDir, "config.json"));
+            Assert(!json.Contains("tvGateway", StringComparison.OrdinalIgnoreCase), "The removed TV Gateway flag should not be written back.");
+            AssertContains(json, "\"splitTunnelExceptions\"");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static async Task TestConfigServiceRoundTripsPreferences()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var service = new ConfigService(tempDir);
+            Assert((await service.LoadPreferencesAsync()).CloseAction == CloseAction.Ask, "The close action should default to asking.");
+
+            await service.SavePreferencesAsync(new AppPreferences { CloseAction = CloseAction.MinimizeToTray });
+            Assert((await service.LoadPreferencesAsync()).CloseAction == CloseAction.MinimizeToTray, "The close action should round-trip.");
+            AssertContains(await File.ReadAllTextAsync(Path.Combine(tempDir, "preferences.json")), "\"minimizeToTray\"");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static Task TestDomainGroupsCanonicalizeWww()
+    {
+        var data = new DomainGroupsData();
+        Assert(data.AddStandaloneDomain("youtube.com"), "Rule should be added.");
+        Assert(!data.AddStandaloneDomain("www.youtube.com"), "www.youtube.com is the same engine entry as youtube.com.");
+        Assert(data.AddException("www.youtube.com"), "An exception for the www. name should be accepted.");
+        Assert(data.ExceptionDomains.SequenceEqual(["youtube.com"]), "The exception should be stored in its canonical form.");
+        Assert(!data.ContainsDomain("youtube.com"), "The exception replaces the rule the engine would otherwise override silently.");
+        return Task.CompletedTask;
+    }
+
+    private static Task TestDomainGroupsNormalizesExceptionPrefixes()
+    {
+        var data = new DomainGroupsData
+        {
+            Groups = [new DomainGroup { Id = "g", Name = "Shop", PrimaryDomain = "shop.com", Domains = ["shop.com", "cdn.shop.com"] }],
+            StandaloneDomains = ["example.net", "*.net"],
+            ExceptionDomains = ["!example.net", "!cdn.shop.com", "!1.2.3.0/24"]
+        };
+
+        var normalized = data.NormalizeEntries();
+
+        Assert(normalized.ExceptionDomains.SequenceEqual(["example.net", "cdn.shop.com"]), $"Unexpected exceptions: {string.Join(", ", normalized.ExceptionDomains)}");
+        Assert(normalized.StandaloneDomains.SequenceEqual(["*.net"]), "A rule for the same pattern as an exception is dropped.");
+        Assert(normalized.Groups.Single().Domains.SequenceEqual(["shop.com"]), "Group domains that are exceptions are dropped from the group.");
+        return Task.CompletedTask;
+    }
+
+    private static async Task TestConfigServiceImportWritesGroupsBeforeNotifying()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var appData = Path.Combine(tempDir, "appdata");
+            var service = new ConfigService(appData);
+            await service.SaveDomainGroupsAsync(new DomainGroupsData { StandaloneDomains = ["old.example.com"] });
+
+            var importPath = Path.Combine(tempDir, "import.json");
+            await File.WriteAllTextAsync(importPath, """
+                { "hostname": "vpn.example.com", "address": "203.0.113.10", "username": "alice", "password": "secret",
+                  "splitTunnelDomains": ["new.example.com"] }
+                """);
+
+            string? groupsSeenOnChange = null;
+            service.ConfigChanged += (_, _) => groupsSeenOnChange = File.ReadAllText(Path.Combine(appData, "domain_groups.json"));
+            await service.ImportConfigAndPersistAsync(importPath);
+
+            Assert(groupsSeenOnChange != null, "Importing should raise ConfigChanged.");
+            Assert(groupsSeenOnChange!.Contains("new.example.com", StringComparison.Ordinal) &&
+                   !groupsSeenOnChange.Contains("old.example.com", StringComparison.Ordinal),
+                "Listeners reloading on ConfigChanged must already see the imported domain groups.");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static async Task TestConfigServiceToleratesOverlappingSaves()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var service = new ConfigService(tempDir);
+            await service.SaveConfigAsync(new ServerConfig { Password = "secret" });
+
+            // Pages save routing on every click and re-read the configuration on every change.
+            var work = Enumerable.Range(0, 24).Select(i => Task.Run(async () =>
+            {
+                if (i % 2 == 0)
+                {
+                    var rules = new DomainGroupsData { StandaloneDomains = [$"site{i}.example.com"] };
+                    await service.SaveSplitTunnelStateAsync(rules, VpnMode.General, [$"app{i}.exe"], ["DE"]);
+                }
+                else
+                {
+                    await service.LoadConfigAsync();
+                    await service.LoadDomainGroupsAsync();
+                }
+            }));
+            await Task.WhenAll(work);
+
+            var final = await service.LoadConfigAsync();
+            Assert(final.Password == "secret" && final.SplitTunnelApps.Count == 1, "The configuration should stay intact after overlapping saves.");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static Task TestServerSetupParsesEndpointVersion()
+    {
+        Assert(ServerSetupService.ParseEndpointVersion("1.0.33") == "1.0.33", "A bare version should be accepted.");
+        Assert(ServerSetupService.ParseEndpointVersion("trusttunnel_endpoint 1.0.33\n") == "1.0.33", "clap-style version output should be accepted.");
+        Assert(ServerSetupService.ParseEndpointVersion("trusttunnel_endpoint 1.0.330") == "1.0.330", "Longer versions must not match a prefix.");
         return Task.CompletedTask;
     }
 
@@ -2503,6 +3125,147 @@ public static class Program
         Assert(fallback.Contains("certbot certonly --non-interactive --apache", StringComparison.Ordinal), "Fallback command should include the Apache fallback after Nginx.");
     }
 
+    private static async Task TestServerSetupPinsEndpointVersion()
+    {
+        var fakeFactory = new FakeServerSetupSshSessionFactory();
+        var setupService = new ServerSetupService(fakeFactory);
+
+        await setupService.InstallServerAsync(CreateServerSetupConfig());
+
+        const string expectedVersion = "1.0.33";
+        const string expectedScriptUrl =
+            "https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/tags/v1.0.33/scripts/install.sh";
+        var expectedInstallCommand =
+            $"curl -fsSL {expectedScriptUrl} " +
+            $"| sh -s -- -a y -V {expectedVersion}";
+
+        Assert(ServerSetupService.EndpointVersion == expectedVersion, "The endpoint release constant should pin the approved server version.");
+        Assert(ServerSetupService.InstallScriptUrl == expectedScriptUrl, "The installer script URL should be pinned to the same immutable release tag.");
+        Assert(setupService.CurrentStep == SetupStep.Completed, "Pinned endpoint installation should complete with the fake SSH server.");
+        Assert(fakeFactory.Session.Commands.Contains(expectedInstallCommand), "Automatic installation should pass the pinned version to install.sh.");
+        Assert(fakeFactory.Session.Commands.Contains("/opt/trusttunnel/trusttunnel_endpoint --version"), "Automatic installation should verify the installed binary version.");
+
+        var installIndex = fakeFactory.Session.Commands.IndexOf(expectedInstallCommand);
+        var versionIndex = fakeFactory.Session.Commands.IndexOf("/opt/trusttunnel/trusttunnel_endpoint --version");
+        Assert(versionIndex > installIndex, "Binary version validation should run after the pinned installer.");
+    }
+
+    private static async Task TestServerSetupRejectsUnexpectedEndpointVersion()
+    {
+        var fakeFactory = new FakeServerSetupSshSessionFactory
+        {
+            Session =
+            {
+                EndpointAlreadyInstalled = true,
+                InstalledEndpointVersion = "1.0.32"
+            }
+        };
+        var setupService = new ServerSetupService(fakeFactory);
+
+        await setupService.InstallServerAsync(CreateServerSetupConfig());
+
+        Assert(setupService.CurrentStep == SetupStep.Failed, "An unexpected installed endpoint version must fail server setup.");
+        Assert(
+            setupService.ErrorMessage?.Contains(
+                "Installed TrustTunnel endpoint version mismatch: expected 1.0.33, got '1.0.32'.",
+                StringComparison.Ordinal) == true,
+            "Version mismatch failure should include both expected and installed versions.");
+        Assert(
+            !fakeFactory.Session.UploadedPaths.Any(),
+            "Server configuration should not be uploaded after endpoint version validation fails.");
+        Assert(
+            fakeFactory.Session.Commands.Contains("systemctl start trusttunnel"),
+            "A failed update should restart the previously installed service.");
+        Assert(
+            fakeFactory.Session.Commands.Contains("systemctl is-active trusttunnel"),
+            "Existing-service recovery should confirm that the restarted service is active.");
+        Assert(
+            setupService.Logs.Any(line => line.Contains("restarted successfully", StringComparison.Ordinal)),
+            "Successful existing-service recovery should be logged.");
+        Assert(
+            fakeFactory.Session.Commands.Contains("systemctl show trusttunnel --property=ActiveState --value 2>/dev/null || true"),
+            "Existing-service recovery should be based on the pre-update ActiveState.");
+
+        var stopIndex = fakeFactory.Session.Commands.IndexOf("systemctl stop trusttunnel || true");
+        var versionIndex = fakeFactory.Session.Commands.IndexOf("/opt/trusttunnel/trusttunnel_endpoint --version");
+        var restartIndex = fakeFactory.Session.Commands.IndexOf("systemctl start trusttunnel");
+        Assert(stopIndex >= 0 && versionIndex > stopIndex, "The existing service should be stopped before the update is validated.");
+        Assert(restartIndex > versionIndex, "Recovery should restart the existing service only after version validation fails.");
+    }
+
+    private static async Task TestServerSetupPreservesInactiveServiceAfterUpdateFailure()
+    {
+        var fakeFactory = new FakeServerSetupSshSessionFactory
+        {
+            Session =
+            {
+                EndpointAlreadyInstalled = true,
+                ExistingServiceActive = false,
+                InstalledEndpointVersion = "1.0.32"
+            }
+        };
+        var setupService = new ServerSetupService(fakeFactory);
+
+        await setupService.InstallServerAsync(CreateServerSetupConfig());
+
+        Assert(setupService.CurrentStep == SetupStep.Failed, "The endpoint version mismatch should still fail setup.");
+        Assert(
+            setupService.ErrorMessage?.Contains(
+                "Installed TrustTunnel endpoint version mismatch: expected 1.0.33, got '1.0.32'.",
+                StringComparison.Ordinal) == true,
+            "Inactive-service handling must preserve the original version mismatch.");
+        Assert(
+            fakeFactory.Session.Commands.Contains("systemctl show trusttunnel --property=ActiveState --value 2>/dev/null || true"),
+            "Setup should inspect the existing service state before stopping it.");
+        Assert(
+            !fakeFactory.Session.Commands.Contains("systemctl start trusttunnel"),
+            "An existing service that was inactive before the update must not be started during failure recovery.");
+        Assert(
+            !setupService.Logs.Any(line => line.Contains("attempting to restart", StringComparison.Ordinal)),
+            "Inactive existing services should not enter the restart recovery path.");
+    }
+
+    private static async Task TestServerSetupToleratesMissingUnitForInstalledBinary()
+    {
+        var fakeFactory = new FakeServerSetupSshSessionFactory
+        {
+            Session =
+            {
+                EndpointAlreadyInstalled = true,
+                ExistingServiceUnitExists = false,
+                InstalledEndpointVersion = "1.0.32"
+            }
+        };
+        var setupService = new ServerSetupService(fakeFactory);
+
+        await setupService.InstallServerAsync(CreateServerSetupConfig());
+
+        Assert(setupService.CurrentStep == SetupStep.Failed, "The later endpoint version mismatch should fail setup.");
+        Assert(
+            fakeFactory.Session.Commands.Contains("/opt/trusttunnel/trusttunnel_endpoint --version"),
+            "A missing service unit should not abort setup before the endpoint update and version validation.");
+        Assert(
+            !fakeFactory.Session.Commands.Contains("systemctl start trusttunnel"),
+            "A service unit that did not exist before the update must not enter restart recovery.");
+        Assert(
+            setupService.ErrorMessage?.Contains("version mismatch", StringComparison.Ordinal) == true,
+            "A non-fatal ActiveState probe must preserve the later installation error.");
+    }
+
+    private static ServerSetupConfig CreateServerSetupConfig() =>
+        new()
+        {
+            Host = "203.0.113.10",
+            SshPort = 22,
+            SshUsername = "root",
+            SshPassword = "ssh-secret",
+            Domain = "vpn.example.com",
+            Email = "admin@example.com",
+            ListenPort = 443,
+            VpnUsername = "alice",
+            VpnPassword = "vpn-secret"
+        };
+
     private static Task TestSplitTunnelSuggestionFilters()
     {
         var service = new SplitTunnelSuggestionService();
@@ -2726,12 +3489,12 @@ public static class Program
         return Task.CompletedTask;
     }
 
-    private static Task TestMainWindowNormalizesManualAppEntries()
+    private static Task TestSplitTunnelEntryNormalizesManualAppEntries()
     {
-        Assert(MainWindow.NormalizeManualExecutableName(" game ") == "game.exe", "Bare manual app names should become Windows process names.");
-        Assert(MainWindow.NormalizeManualExecutableName(@"D:\SteamLibrary\steamapps\common\Game\Game-Win64-Shipping.exe") == "Game-Win64-Shipping.exe", "Manual full paths should store only the executable process name.");
-        Assert(MainWindow.NormalizeManualExecutableName("\"C:\\Games\\Cool Game\\coolgame.exe\" --launcher") == "coolgame.exe", "Quoted commands with arguments should keep the executable process name.");
-        Assert(MainWindow.NormalizeManualExecutableName("   ") == "", "Blank manual app entries should be ignored.");
+        Assert(SplitTunnelEntry.NormalizeAppProcessName(" game ") == "game.exe", "Bare manual app names should become Windows process names.");
+        Assert(SplitTunnelEntry.NormalizeAppProcessName(@"D:\SteamLibrary\steamapps\common\Game\Game-Win64-Shipping.exe") == "Game-Win64-Shipping.exe", "Manual full paths should store only the executable process name.");
+        Assert(SplitTunnelEntry.NormalizeAppProcessName("\"C:\\Games\\Cool Game\\coolgame.exe\" --launcher") == "coolgame.exe", "Quoted commands with arguments should keep the executable process name.");
+        Assert(SplitTunnelEntry.NormalizeAppProcessName("   ") == "", "Blank manual app entries should be ignored.");
         return Task.CompletedTask;
     }
 
@@ -2887,6 +3650,165 @@ public static class Program
             AssertContains(writtenToml, "\"203.0.113.0/24\"");
             Assert(vpnService.Logs.Any(line => line.Contains("GeoIP exclusions loaded: 1 CIDR ranges", StringComparison.Ordinal)), "GeoIP resolution log missing.");
             Assert(vpnService.Logs.Any(line => line.Contains("Connected successfully.", StringComparison.Ordinal)), "Successful connection log missing.");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static async Task TestVpnServiceSystemProxyWithoutWintun()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var clientDir = Path.Combine(tempDir, "client");
+            Directory.CreateDirectory(clientDir);
+            await File.WriteAllTextAsync(
+                Path.Combine(clientDir, "trusttunnel_client.exe"),
+                "fake executable placeholder");
+
+            var fakeProcess = new FakeVpnClientProcess();
+            var fakeProxy = new FakeSystemProxyManager();
+            var configService = new ConfigService(tempDir, [clientDir]);
+            using var vpnService = new VpnService(
+                configService,
+                _ => fakeProcess,
+                startupProbeDelay: TimeSpan.Zero,
+                wintunReleaseDelay: TimeSpan.FromSeconds(30),
+                processExitReleaseDelay: TimeSpan.Zero,
+                systemProxyManager: fakeProxy);
+
+            await vpnService.ConnectAsync(new ServerConfig
+            {
+                Hostname = "vpn.example.com",
+                Address = "203.0.113.10",
+                Username = "alice",
+                Password = "secret",
+                Dns = "8.8.8.8",
+                ConnectionMode = VpnConnectionMode.SystemProxy,
+                SplitTunnelCountries = ["US"]
+            });
+
+            var configPath = await configService.GetConfigFilePathAsync();
+            var toml = await File.ReadAllTextAsync(configPath);
+
+            Assert(vpnService.Status == VpnStatus.Connected, "System Proxy mode should connect without wintun.dll.");
+            Assert(fakeProxy.RecoverCalls == 1, "System Proxy manager should recover stale settings on service construction.");
+            Assert(fakeProxy.EnableCalls == 1, "System Proxy manager should be enabled after the client stays alive.");
+            Assert(fakeProxy.LastPort == ServerConfig.SystemProxySocksPort, "System Proxy should use the configured local SOCKS port.");
+            AssertContains(toml, "[listener.socks]");
+            Assert(!toml.Contains("[listener.tun]", StringComparison.Ordinal), "System Proxy client config must not contain a TUN listener.");
+            Assert(!toml.Contains("\"203.0.113.0/24\"", StringComparison.Ordinal), "System Proxy startup should skip GeoIP resolution.");
+
+            await vpnService.DisconnectAsync();
+
+            Assert(vpnService.Status == VpnStatus.Disconnected, "System Proxy mode should disconnect normally.");
+            Assert(fakeProxy.RestoreCalls == 1, "Disconnect should restore the previous Windows proxy settings.");
+            Assert(!fakeProxy.IsEnabled, "System Proxy manager should be disabled after restore.");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static async Task TestVpnServiceSystemProxyRestoresAfterExit()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var clientDir = Path.Combine(tempDir, "client");
+            Directory.CreateDirectory(clientDir);
+            await File.WriteAllTextAsync(
+                Path.Combine(clientDir, "trusttunnel_client.exe"),
+                "fake executable placeholder");
+
+            var fakeProcess = new FakeVpnClientProcess();
+            var fakeProxy = new FakeSystemProxyManager();
+            var configService = new ConfigService(tempDir, [clientDir]);
+            using var vpnService = new VpnService(
+                configService,
+                _ => fakeProcess,
+                startupProbeDelay: TimeSpan.Zero,
+                wintunReleaseDelay: TimeSpan.Zero,
+                processExitReleaseDelay: TimeSpan.FromMilliseconds(1),
+                systemProxyManager: fakeProxy);
+
+            await vpnService.ConnectAsync(new ServerConfig
+            {
+                Hostname = "vpn.example.com",
+                Address = "203.0.113.10",
+                Username = "alice",
+                Password = "secret",
+                Dns = "8.8.8.8",
+                ConnectionMode = VpnConnectionMode.SystemProxy
+            });
+
+            fakeProcess.TriggerExit(7);
+            await Task.Delay(TimeSpan.FromMilliseconds(20));
+
+            Assert(vpnService.Status == VpnStatus.Disconnected, "System Proxy mode should become disconnected after a client crash.");
+            Assert(fakeProxy.RestoreCalls == 1, "A spontaneous client exit must restore Windows proxy settings.");
+            Assert(!fakeProxy.IsEnabled, "A spontaneous client exit must not leave System Proxy enabled.");
+            Assert(vpnService.Logs.Any(line => line.Contains("System Proxy settings restored", StringComparison.Ordinal)), "Proxy restoration should be visible in the log.");
+        }
+        finally
+        {
+            Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static async Task TestVpnServiceSystemProxyRestoresDuringActivationExit()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+
+        try
+        {
+            var clientDir = Path.Combine(tempDir, "client");
+            Directory.CreateDirectory(clientDir);
+            await File.WriteAllTextAsync(
+                Path.Combine(clientDir, "trusttunnel_client.exe"),
+                "fake executable placeholder");
+
+            var fakeProcess = new FakeVpnClientProcess();
+            var fakeProxy = new FakeSystemProxyManager
+            {
+                Enabled = () => fakeProcess.TriggerExit(9)
+            };
+            var configService = new ConfigService(tempDir, [clientDir]);
+            using var vpnService = new VpnService(
+                configService,
+                _ => fakeProcess,
+                startupProbeDelay: TimeSpan.Zero,
+                wintunReleaseDelay: TimeSpan.Zero,
+                processExitReleaseDelay: TimeSpan.Zero,
+                systemProxyManager: fakeProxy);
+
+            var ex = await AssertThrowsAsync<InvalidOperationException>(() => vpnService.ConnectAsync(new ServerConfig
+            {
+                Hostname = "vpn.example.com",
+                Address = "203.0.113.10",
+                Username = "alice",
+                Password = "secret",
+                Dns = "8.8.8.8",
+                ConnectionMode = VpnConnectionMode.SystemProxy
+            }));
+
+            Assert(
+                ex.Message == "Process exited while System Proxy was being enabled.",
+                "An activation-time client exit should report the precise startup failure.");
+            Assert(vpnService.Status == VpnStatus.Disconnected, "Activation-time exit should leave Veil disconnected.");
+            Assert(fakeProxy.RestoreCalls == 1, "Activation-time exit must restore Windows proxy settings.");
+            Assert(!fakeProxy.IsEnabled, "Activation-time exit must not leave System Proxy enabled.");
+            Assert(
+                !vpnService.Logs.Any(line => line.Contains("Connected successfully.", StringComparison.Ordinal)),
+                "Activation-time exit must never be reported as a successful connection.");
         }
         finally
         {
@@ -3581,6 +4503,9 @@ public static class Program
         public bool EndpointAlreadyInstalled { get; set; }
         public bool CertificateMissingInitially { get; set; }
         public bool FailStandaloneCertbotPortBusy { get; set; }
+        public bool ExistingServiceActive { get; set; } = true;
+        public bool ExistingServiceUnitExists { get; set; } = true;
+        public string InstalledEndpointVersion { get; set; } = "1.0.33";
         public HashSet<int> BusyListenPorts { get; } = [];
         public List<string> Operations { get; } = [];
         public List<string> Commands { get; } = [];
@@ -3611,6 +4536,11 @@ public static class Program
                 }
 
                 return Success();
+            }
+
+            if (command == "/opt/trusttunnel/trusttunnel_endpoint --version")
+            {
+                return Success(InstalledEndpointVersion);
             }
 
             if (command == "which curl")
@@ -3693,6 +4623,16 @@ public static class Program
                 return Success("active");
             }
 
+            if (command == "systemctl show trusttunnel --property=ActiveState --value 2>/dev/null || true")
+            {
+                if (!ExistingServiceUnitExists)
+                {
+                    return Success();
+                }
+
+                return Success(ExistingServiceActive ? "active" : "inactive");
+            }
+
             throw new InvalidOperationException($"Unexpected fake SSH command: {command}");
         }
 
@@ -3724,6 +4664,39 @@ public static class Program
             HttpRequestMessage request,
             CancellationToken cancellationToken) =>
             Task.FromResult(responder(request));
+    }
+
+    private sealed class FakeSystemProxyManager : ISystemProxyManager
+    {
+        public bool IsEnabled { get; private set; }
+        public Action? Enabled { get; init; }
+        public int RecoverCalls { get; private set; }
+        public int EnableCalls { get; private set; }
+        public int RestoreCalls { get; private set; }
+        public int DisposeCalls { get; private set; }
+        public int LastPort { get; private set; }
+
+        public void RecoverStaleState() => RecoverCalls++;
+
+        public void EnableSocksProxy(int port)
+        {
+            EnableCalls++;
+            LastPort = port;
+            IsEnabled = true;
+            Enabled?.Invoke();
+        }
+
+        public void Restore()
+        {
+            RestoreCalls++;
+            IsEnabled = false;
+        }
+
+        public void Dispose()
+        {
+            DisposeCalls++;
+            IsEnabled = false;
+        }
     }
 
     private sealed class FakeVpnClientProcess : IVpnClientProcess

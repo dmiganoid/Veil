@@ -13,19 +13,18 @@
     <AssemblyTitle>Veil</AssemblyTitle>
     <AssemblyName>Veil</AssemblyName>
     <RootNamespace>Veil</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>Veil contributors</Authors>
     <Description>Windows WPF client for TrustTunnel VPN with split tunneling and server setup tools.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <!-- Only ship framework resources for the languages Veil supports. -->
+    <SatelliteResourceLanguages>en;ru</SatelliteResourceLanguages>
+    <!-- Keep tests, build output and release folders out of the app's default item globs. -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);Veil.Tests\**;artifacts\**;release\**;dist\**;docs\**;engine\**;installer\**;ui-previews\**</DefaultItemExcludes>
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="SSH.NET" Version="2025.1.0" />
-  </ItemGroup>
-
-  <ItemGroup>
-    <Compile Remove="Veil.Tests\**\*.cs" />
-    <None Remove="Veil.Tests\**\*" />
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -36,7 +35,7 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Assets\tray_icon.ico">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="client\trusttunnel_client.exe" Condition="Exists('client\trusttunnel_client.exe')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

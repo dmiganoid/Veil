@@ -44,3 +44,10 @@ client/*
 # NuGet/package output
 *.nupkg
 *.snupkg
+
+# Local VPN profiles contain credentials.
+/veil-config.json
+/veil-config-new.json
+
+# Local assistant attachments.
+.codex-remote-attachments/

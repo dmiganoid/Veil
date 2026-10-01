@@ -1,28 +1,3 @@
-﻿From a1439ebc1b29b45027453712935717605c0ed367 Mon Sep 17 00:00:00 2001
-From: dmiganoid <dmiganoid@gmail.com>
-Date: Fri, 19 Jun 2026 02:24:16 +0300
-Subject: [PATCH] Add Veil process-aware split tunneling
-
----
- README.md                                 |   7 +
- core/include/vpn/internal/domain_filter.h |  11 +-
- core/src/domain_filter.cpp                |  54 +++-
- core/src/tun_device_listener.cpp          |   3 +-
- core/src/tunnel.cpp                       |   5 +-
- core/src/vpn_manager.cpp                  |   1 +
- core/test/test_domain_filter.cpp          |  45 ++++
- tcpip/CMakeLists.txt                      |   2 +
- tcpip/include/tcpip/tcpip.h               |   1 +
- tcpip/src/process_resolver.cpp            | 297 ++++++++++++++++++++++
- tcpip/src/process_resolver.h              |  11 +
- tcpip/src/tcp_conn_manager.cpp            |   3 +
- tcpip/src/udp_conn_manager.cpp            |   3 +
- trusttunnel/README.md                     |   4 +
- trusttunnel/setup_wizard/src/settings.rs  |   6 +
- 15 files changed, 447 insertions(+), 6 deletions(-)
- create mode 100644 tcpip/src/process_resolver.cpp
- create mode 100644 tcpip/src/process_resolver.h
-
 diff --git a/README.md b/README.md
 index e1bfc61..c407166 100644
 --- a/README.md
@@ -40,7 +15,7 @@ index e1bfc61..c407166 100644
  <picture>
  <source media="(prefers-color-scheme: dark)" srcset="https://cdn.adguardcdn.com/website/github.com/TrustTunnel/logo_dark.svg" width="300px" alt="TrustTunnel" />
 diff --git a/core/include/vpn/internal/domain_filter.h b/core/include/vpn/internal/domain_filter.h
-index 6019512..514ae0d 100644
+index 6019512..967c54f 100644
 --- a/core/include/vpn/internal/domain_filter.h
 +++ b/core/include/vpn/internal/domain_filter.h
 @@ -2,9 +2,11 @@
@@ -55,28 +30,38 @@ index 6019512..514ae0d 100644
  #include <unordered_set>
  #include <variant>
  #include <vector>
-@@ -22,6 +24,7 @@ enum DomainFilterValidationStatus {
+@@ -22,6 +24,8 @@ enum DomainFilterValidationStatus {
      DFVS_OK_CIDR,
      DFVS_OK_DOMAIN,
      DFVS_OK_PORT,
 +    DFVS_OK_APP,
++    DFVS_OK_DOMAIN_EXCEPTION,
      DFVS_MALFORMED,
  };
  
-@@ -112,19 +115,25 @@ private:
+@@ -112,19 +116,36 @@ private:
      struct PortOnlyEntry {
          uint16_t port;
      };
 +    struct AppEntryInfo {
 +        std::string name;
 +    };
++    /// A `!`-prefixed domain entry. It cancels broader domain entries for the matching names,
++    /// e.g. `*.net !example.net` treats every `.net` domain as an exclusion except `example.net`.
++    struct DomainExceptionInfo {
++        std::string text;
++        MatchFlagsSet flags;
++    };
      struct DomainEntryMalformed {};
 -    using ParseResult = std::variant<SocketAddress, CidrRange, DomainEntryInfo, PortOnlyEntry, DomainEntryMalformed>;
-+    using ParseResult =
-+            std::variant<SocketAddress, CidrRange, DomainEntryInfo, PortOnlyEntry, AppEntryInfo, DomainEntryMalformed>;
++    using ParseResult = std::variant<SocketAddress, CidrRange, DomainEntryInfo, PortOnlyEntry, AppEntryInfo,
++            DomainExceptionInfo, DomainEntryMalformed>;
++    using DomainTable = std::unordered_map<std::string, MatchFlagsSet>; // key - domain name / value - `MatchFlags`
  
      VpnMode m_mode = VPN_MODE_GENERAL;
-     std::unordered_map<std::string, MatchFlagsSet> m_domains; // key - domain name / value - set of `MatchFlags`
+-    std::unordered_map<std::string, MatchFlagsSet> m_domains; // key - domain name / value - set of `MatchFlags`
++    DomainTable m_domains;
++    DomainTable m_domain_exceptions;
      std::unordered_set<SocketAddress> m_addresses;
      std::unordered_set<uint16_t> m_ports_only;
 +    std::unordered_set<std::string> m_apps;
@@ -86,12 +71,15 @@ index 6019512..514ae0d 100644
      ag::Logger m_log{"DOMAIN_FILTER"};
  
      static ParseResult parse_entry(std::string_view entry);
++    static ParseResult parse_domain_entry(std::string_view entry);
++    static bool table_matches(
++            const DomainTable &table, std::string_view seek, std::string_view domain, bool www_prefixed);
 +    static std::string normalize_app_name(std::string_view app_name);
  };
  
  } // namespace ag
 diff --git a/core/src/domain_filter.cpp b/core/src/domain_filter.cpp
-index c1753a5..bc4d0f0 100644
+index c1753a5..16144b7 100644
 --- a/core/src/domain_filter.cpp
 +++ b/core/src/domain_filter.cpp
 @@ -1,5 +1,8 @@
@@ -103,17 +91,18 @@ index c1753a5..bc4d0f0 100644
  #include "common/defs.h"
  #include "vpn/internal/utils.h"
  #include "vpn/utils.h"
-@@ -10,6 +13,9 @@ namespace ag {
+@@ -10,6 +13,10 @@ namespace ag {
  
  static constexpr std::string_view WWW_PREFIX = "www.";
  static constexpr std::string_view WILDCARD_PREFIX = "*.";
 +static constexpr std::string_view APP_PREFIX = "app:";
 +static constexpr std::string_view PROCESS_PREFIX = "process:";
 +static constexpr std::string_view WINDOWS_EXECUTABLE_SUFFIX = ".exe";
++static constexpr std::string_view EXCEPTION_PREFIX = "!";
  
  enum DomainFilter::MatchFlags : uint32_t {
      DFMM_EXACT,      // match the domain itself and www. + the domain
-@@ -25,14 +31,37 @@ DomainFilterValidationStatus DomainFilter::validate_entry(std::string_view entry
+@@ -25,14 +32,48 @@ DomainFilterValidationStatus DomainFilter::validate_entry(std::string_view entry
      static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_ADDR, ParseResult>, SocketAddress>);
      static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_CIDR, ParseResult>, CidrRange>);
      static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_DOMAIN, ParseResult>, DomainEntryInfo>);
@@ -121,8 +110,10 @@ index c1753a5..bc4d0f0 100644
      static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_PORT, ParseResult>, PortOnlyEntry>);
 -    static_assert(std::variant_size_v<ParseResult> == 5);
 +    static_assert(std::is_same_v<std::variant_alternative_t<DFVS_OK_APP, ParseResult>, AppEntryInfo>);
++    static_assert(
++            std::is_same_v<std::variant_alternative_t<DFVS_OK_DOMAIN_EXCEPTION, ParseResult>, DomainExceptionInfo>);
 +    static_assert(std::is_same_v<std::variant_alternative_t<DFVS_MALFORMED, ParseResult>, DomainEntryMalformed>);
-+    static_assert(std::variant_size_v<ParseResult> == 6);
++    static_assert(std::variant_size_v<ParseResult> == 7);
  
      return DomainFilterValidationStatus(result.index());
  }
@@ -141,6 +132,15 @@ index c1753a5..bc4d0f0 100644
 +}
 +
  DomainFilter::ParseResult DomainFilter::parse_entry(std::string_view entry) {
++    if (starts_with(entry, EXCEPTION_PREFIX)) {
++        entry.remove_prefix(EXCEPTION_PREFIX.length());
++        ParseResult result = parse_domain_entry(entry);
++        if (auto *domain_info = std::get_if<DomainEntryInfo>(&result); domain_info != nullptr) {
++            return DomainExceptionInfo{std::move(domain_info->text), domain_info->flags};
++        }
++        return DomainEntryMalformed{};
++    }
++
 +    if (starts_with(entry, APP_PREFIX) || starts_with(entry, PROCESS_PREFIX)) {
 +        entry.remove_prefix(starts_with(entry, APP_PREFIX) ? APP_PREFIX.length() : PROCESS_PREFIX.length());
 +        std::string app_name = normalize_app_name(entry);
@@ -153,7 +153,7 @@ index c1753a5..bc4d0f0 100644
      SocketAddress addr{};
      Result split = utils::split_host_port(entry);
      if (!split.has_error()) {
-@@ -56,6 +85,14 @@ DomainFilter::ParseResult DomainFilter::parse_entry(std::string_view entry) {
+@@ -56,9 +97,21 @@ DomainFilter::ParseResult DomainFilter::parse_entry(std::string_view entry) {
          return range;
      }
  
@@ -165,28 +165,130 @@ index c1753a5..bc4d0f0 100644
 +        }
 +    }
 +
++    return parse_domain_entry(entry);
++}
++
++DomainFilter::ParseResult DomainFilter::parse_domain_entry(std::string_view entry) {
      std::string_view domain = entry;
-     if (domain.starts_with("*.")) {
-         domain.remove_prefix(2);
-@@ -93,6 +130,7 @@ bool DomainFilter::update_exclusions(VpnMode mode_, std::string_view exclusions)
+-    if (domain.starts_with("*.")) {
+-        domain.remove_prefix(2);
++    if (domain.starts_with(WILDCARD_PREFIX)) {
++        domain.remove_prefix(WILDCARD_PREFIX.length());
+     }
+     if (domain.empty()) {
+         return DomainEntryMalformed{};
+@@ -91,8 +144,10 @@ DomainFilter::ParseResult DomainFilter::parse_entry(std::string_view entry) {
+ bool DomainFilter::update_exclusions(VpnMode mode_, std::string_view exclusions) {
+     m_mode = mode_;
      m_domains.clear();
++    m_domain_exceptions.clear();
      m_addresses.clear();
      m_ports_only.clear();
 +    m_apps.clear();
      m_exclusion_suspects.clear();
      m_cidr_ranges.clear();
  
-@@ -110,6 +148,9 @@ bool DomainFilter::update_exclusions(VpnMode mode_, std::string_view exclusions)
+@@ -110,6 +165,12 @@ bool DomainFilter::update_exclusions(VpnMode mode_, std::string_view exclusions)
          } else if (auto *port_only = std::get_if<PortOnlyEntry>(&result); port_only != nullptr) {
              log_filter(this, trace, "Entry added in ports only table: {}", port_only->port);
              m_ports_only.insert(port_only->port);
 +        } else if (auto *app_info = std::get_if<AppEntryInfo>(&result); app_info != nullptr) {
 +            log_filter(this, trace, "Entry added in app table: {}", app_info->name);
 +            m_apps.insert(std::move(app_info->name));
++        } else if (auto *exception_info = std::get_if<DomainExceptionInfo>(&result); exception_info != nullptr) {
++            log_filter(this, trace, "Entry added in domain exceptions table: {}", exception_info->text);
++            m_domain_exceptions[std::move(exception_info->text)] |= exception_info->flags;
          } else {
              auto status = std::get<DomainEntryMalformed>(result);
              (void) status;
-@@ -168,6 +209,15 @@ DomainFilterMatchStatus DomainFilter::match_domain(std::string_view domain) cons
+@@ -117,10 +178,37 @@ bool DomainFilter::update_exclusions(VpnMode mode_, std::string_view exclusions)
+         }
+     };
+ 
++    if (exclusions.find('\n') != std::string_view::npos) {
++        // Line-separated list: entries may contain spaces (e.g. application names), so only trim them.
++        size_t start = 0;
++        while (start <= exclusions.size()) {
++            size_t end = exclusions.find('\n', start);
++            if (end == std::string_view::npos) {
++                end = exclusions.size();
++            }
++
++            std::string_view line = exclusions.substr(start, end - start);
++            while (!line.empty() && isspace((unsigned char) line.front())) {
++                line.remove_prefix(1);
++            }
++            while (!line.empty() && isspace((unsigned char) line.back())) {
++                line.remove_suffix(1);
++            }
++            if (!line.empty()) {
++                add_entry(std::string(line));
++            }
++
++            start = end + 1;
++        }
++
++        return true;
++    }
++
++    // Legacy whitespace-separated list.
+     std::string buffer;
+ 
+     for (char ch : exclusions) {
+-        if (!isspace(ch)) {
++        if (!isspace((unsigned char) ch)) {
+             buffer.push_back(ch);
+         } else if (!buffer.empty()) {
+             add_entry(buffer);
+@@ -135,23 +223,35 @@ bool DomainFilter::update_exclusions(VpnMode mode_, std::string_view exclusions)
+     return true;
+ }
+ 
++bool DomainFilter::table_matches(
++        const DomainTable &table, std::string_view seek, std::string_view domain, bool www_prefixed) {
++    auto i = table.find(std::string(seek));
++    if (i == table.end()) {
++        return false;
++    }
++
++    MatchFlagsSet flags = i->second;
++    return (flags.test(DFMM_EXACT)
++                   && (seek.length() == domain.length()
++                           || (www_prefixed && seek.length() + WWW_PREFIX.length() == domain.length())))
++            || (flags.test(DFMM_SUBDOMAINS) && (seek.length() < domain.length()));
++}
++
+ DomainFilterMatchStatus DomainFilter::match_domain(std::string_view domain) const {
+     bool www_prefixed = starts_with(domain, WWW_PREFIX);
+     std::string seek = !www_prefixed ? std::string(domain) : std::string(domain.substr(WWW_PREFIX.length()));
+ 
++    // Names are checked from the most specific to the least specific one, so the most specific
++    // entry wins. An exception overrides an exclusion declared for the same name.
+     while (true) {
+-        auto i = m_domains.find(seek);
+-        if (i != m_domains.end()) {
+-            MatchFlagsSet flags = i->second;
+-
+-            bool found = (flags.test(DFMM_EXACT)
+-                                 && (seek.length() == domain.length()
+-                                         || (www_prefixed && seek.length() + WWW_PREFIX.length() == domain.length())))
+-                    || (flags.test(DFMM_SUBDOMAINS) && (seek.length() < domain.length()));
+-            if (found) {
+-                log_filter(this, dbg, "Matched domain: {}", seek);
+-                return DFMS_EXCLUSION;
+-            }
++        if (table_matches(m_domain_exceptions, seek, domain, www_prefixed)) {
++            log_filter(this, dbg, "Matched domain exception: {}", seek);
++            return DFMS_DEFAULT;
++        }
++
++        if (table_matches(m_domains, seek, domain, www_prefixed)) {
++            log_filter(this, dbg, "Matched domain: {}", seek);
++            return DFMS_EXCLUSION;
+         }
+ 
+         size_t next_dot = seek.find('.');
+@@ -168,6 +268,15 @@ DomainFilterMatchStatus DomainFilter::match_domain(std::string_view domain) cons
  DomainFilterMatchResult DomainFilter::match_tag(const SockAddrTag &tag) const {
      DomainFilterMatchResult result{.status = DFMS_DEFAULT};
  
@@ -233,22 +335,64 @@ index f5d049f..695ceb5 100644
          add_connection(this, conn);
  
 diff --git a/core/src/vpn_manager.cpp b/core/src/vpn_manager.cpp
-index 6694f6e..2548bca 100644
+index 6694f6e..0f1a241 100644
 --- a/core/src/vpn_manager.cpp
 +++ b/core/src/vpn_manager.cpp
-@@ -654,6 +654,7 @@ VpnExclusionValidationStatus vpn_validate_exclusion(const char *text) {
+@@ -654,6 +654,8 @@ VpnExclusionValidationStatus vpn_validate_exclusion(const char *text) {
      case DFVS_OK_CIDR:
      case DFVS_OK_DOMAIN:
      case DFVS_OK_PORT:
 +    case DFVS_OK_APP:
++    case DFVS_OK_DOMAIN_EXCEPTION:
          return VPN_EVS_OK;
      case DFVS_MALFORMED:
          return VPN_EVS_MALFORMED;
 diff --git a/core/test/test_domain_filter.cpp b/core/test/test_domain_filter.cpp
-index 042e8c1..258951b 100644
+index 042e8c1..056a25b 100644
 --- a/core/test/test_domain_filter.cpp
 +++ b/core/test/test_domain_filter.cpp
-@@ -140,6 +140,45 @@ static const MatchTestParam ADDRESS_NOMATCH_TEST_SAMPLES[] = {
+@@ -77,6 +77,40 @@ static const MatchTestParam DOMAIN_NOMATCH_TEST_SAMPLES[] = {
+ };
+ INSTANTIATE_TEST_SUITE_P(Simple, DomainNoMatch, testing::ValuesIn(DOMAIN_NOMATCH_TEST_SAMPLES));
+ 
++class DomainExceptionMatch : public MatchTest {};
++TEST_P(DomainExceptionMatch, StillExcluded) {
++    const MatchTestParam &param = GetParam();
++    ASSERT_EQ(DFMS_EXCLUSION, filter.match_domain(param.entry));
++}
++
++static const MatchTestParam DOMAIN_EXCEPTION_EXCLUDED_SAMPLES[] = {
++        {VPN_MODE_GENERAL, "*.net !example.net", "other.net"},
++        {VPN_MODE_GENERAL, "*.net !example.net", "sub.other.net"},
++        {VPN_MODE_GENERAL, "*.net !example.net", "sub.example.net"},
++        {VPN_MODE_GENERAL, "!example.net *.net", "other.net"},
++        {VPN_MODE_GENERAL, "*.net !*.example.net *.cdn.example.net", "a.cdn.example.net"},
++        {VPN_MODE_SELECTIVE, "*.net !example.net", "other.net"},
++};
++INSTANTIATE_TEST_SUITE_P(Exceptions, DomainExceptionMatch, testing::ValuesIn(DOMAIN_EXCEPTION_EXCLUDED_SAMPLES));
++
++class DomainExceptionNoMatch : public MatchTest {};
++TEST_P(DomainExceptionNoMatch, Excepted) {
++    const MatchTestParam &param = GetParam();
++    ASSERT_EQ(DFMS_DEFAULT, filter.match_domain(param.entry));
++}
++
++static const MatchTestParam DOMAIN_EXCEPTION_DEFAULT_SAMPLES[] = {
++        {VPN_MODE_GENERAL, "*.net !example.net", "example.net"},
++        {VPN_MODE_GENERAL, "*.net !example.net", "www.example.net"},
++        {VPN_MODE_GENERAL, "!example.net *.net", "example.net"},
++        {VPN_MODE_GENERAL, "*.net !example.net !*.example.net", "sub.example.net"},
++        {VPN_MODE_GENERAL, "*.net !*.example.net", "deep.sub.example.net"},
++        {VPN_MODE_GENERAL, "example.net !example.net", "example.net"},
++        {VPN_MODE_GENERAL, "!example.net", "example.net"},
++        {VPN_MODE_SELECTIVE, "*.net !example.net", "example.net"},
++};
++INSTANTIATE_TEST_SUITE_P(Exceptions, DomainExceptionNoMatch, testing::ValuesIn(DOMAIN_EXCEPTION_DEFAULT_SAMPLES));
++
+ class AddressMatch : public MatchTest {};
+ TEST_P(AddressMatch, Test) {
+     const MatchTestParam &param = GetParam();
+@@ -140,6 +174,59 @@ static const MatchTestParam ADDRESS_NOMATCH_TEST_SAMPLES[] = {
  };
  INSTANTIATE_TEST_SUITE_P(Simple, AddressNoMatch, testing::ValuesIn(ADDRESS_NOMATCH_TEST_SAMPLES));
  
@@ -280,6 +424,20 @@ index 042e8c1..258951b 100644
 +};
 +INSTANTIATE_TEST_SUITE_P(Simple, AppMatch, testing::ValuesIn(APP_MATCH_TEST_SAMPLES));
 +
++TEST(AppFilterTest, LineSeparatedEntriesKeepSpaces) {
++    DomainFilter filter = {};
++    SocketAddress address{"1.2.3.4:443"};
++    ASSERT_TRUE(address.valid());
++
++    ASSERT_TRUE(filter.update_exclusions(VPN_MODE_GENERAL, "Hollow Knight.exe\n  *.net \r\n!example.net\n\n"));
++
++    ASSERT_EQ(DFMS_EXCLUSION, filter.match_tag({address, R"(D:\Games\Hollow Knight\hollow knight.exe)"}).status);
++    ASSERT_EQ(DFMS_DEFAULT, filter.match_tag({address, "knight.exe"}).status);
++    ASSERT_EQ(DFMS_EXCLUSION, filter.match_domain("other.net"));
++    ASSERT_EQ(DFMS_DEFAULT, filter.match_domain("example.net"));
++    ASSERT_EQ(DFMS_DEFAULT, filter.match_domain("hollow"));
++}
++
 +TEST(AppFilterTest, DifferentAppDoesNotMatch) {
 +    DomainFilter filter = {};
 +    SocketAddress address{"1.2.3.4:443"};
@@ -294,7 +452,7 @@ index 042e8c1..258951b 100644
  struct TagsTestParam {
      std::string address;
      std::string app;
-@@ -201,6 +240,10 @@ TEST(DomainFilterTest, ValidateEntry) {
+@@ -201,6 +288,15 @@ TEST(DomainFilterTest, ValidateEntry) {
      ASSERT_EQ(DFVS_OK_ADDR, DomainFilter::validate_entry("fd::"));
      ASSERT_EQ(DFVS_OK_CIDR, DomainFilter::validate_entry("fd::/64"));
      ASSERT_EQ(DFVS_OK_DOMAIN, DomainFilter::validate_entry("*.google"));
@@ -302,10 +460,15 @@ index 042e8c1..258951b 100644
 +    ASSERT_EQ(DFVS_OK_APP, DomainFilter::validate_entry("app:deadlock.exe"));
 +    ASSERT_EQ(DFVS_OK_APP, DomainFilter::validate_entry("process:deadlock.exe"));
 +    ASSERT_EQ(DFVS_OK_DOMAIN, DomainFilter::validate_entry("*.exe"));
++    ASSERT_EQ(DFVS_OK_DOMAIN_EXCEPTION, DomainFilter::validate_entry("!example.net"));
++    ASSERT_EQ(DFVS_OK_DOMAIN_EXCEPTION, DomainFilter::validate_entry("!*.example.net"));
++    ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("!"));
++    ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("!1.2.3.0/24"));
++    ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("!!example.net"));
  
      ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("1.1.1.1:0"));
      ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("1.2.3.0/33"));
-@@ -216,6 +259,8 @@ TEST(DomainFilterTest, ValidateEntry) {
+@@ -216,6 +312,8 @@ TEST(DomainFilterTest, ValidateEntry) {
      ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("*:0"));
      ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("*:65536"));
      ASSERT_EQ(DFVS_MALFORMED, DomainFilter::validate_entry("*:abc"));
@@ -714,16 +877,24 @@ index 499664a..d3ba5c4 100644
  
      TcpipHandler *callbacks = &ctx->parameters.handler;
 diff --git a/trusttunnel/README.md b/trusttunnel/README.md
-index 08e87df..907505a 100644
+index 08e87df..f70b036 100644
 --- a/trusttunnel/README.md
 +++ b/trusttunnel/README.md
-@@ -164,6 +164,10 @@ The `exclusions` array supports the following formats:
+@@ -159,11 +159,18 @@ The `exclusions` array supports the following formats:
+ - **Domain name**: `example.com` — matches `example.com` and `www.example.com`
+ - **Wildcard domain**: `*.example.com` — matches any subdomain
+   (e.g., `sub.example.com`), but not the domain itself
++- **Domain exception**: `!example.com` or `!*.example.com` — cancels broader domain entries for the
++  matching names. The most specific entry wins, so `*.net` together with `!example.net` treats every
++  `.net` domain as an exclusion except `example.net`
+ - **IPv4 address**: `192.168.1.1` or `192.168.1.1:443` (port optional)
+ - **IPv6 address**: `[::1]` or `[::1]:443` or `2001:db8::1`
  - **CIDR range**: `192.168.0.0/16` or `2001:db8::/32`
  - **Wildcard port**: `*:80` — matches any connection to the specified port regardless of destination address
  
 +- **Application process**: `deadlock.exe`, `app:deadlock.exe`, or `process:deadlock.exe` - matches
 +  connections initiated by that process name. Windows process matching is case-insensitive and also accepts
-+  full paths by comparing only the executable basename.
++  full paths by comparing only the executable basename. Names may contain spaces (`Hollow Knight.exe`).
 +
  ### DNS Upstreams Syntax
  
@@ -745,6 +916,18 @@ index e763564..ee0b320 100644
    * CIDR range
      * recognized formats are:
        * IPv4Address/mask
--- 
-2.52.0.windows.1
-
+diff --git a/trusttunnel/src/config.cpp b/trusttunnel/src/config.cpp
+index f8b5b4a..e9737d6 100644
+--- a/trusttunnel/src/config.cpp
++++ b/trusttunnel/src/config.cpp
+@@ -302,8 +302,9 @@ std::optional<TrustTunnelConfig> TrustTunnelConfig::build_config(const toml::tab
+     if (const auto *x = config["exclusions"].as_array(); x != nullptr) {
+         for (const auto &e : *x) {
+             if (std::optional ex = e.value<std::string_view>(); ex.has_value() && !ex->empty()) {
++                // One entry per line, so that entries such as "Hollow Knight.exe" keep their spaces.
+                 result.exclusions.append(ex.value());
+-                result.exclusions.push_back(' ');
++                result.exclusions.push_back('\n');
+             }
+         }
+     }
