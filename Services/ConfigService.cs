@@ -14,7 +14,12 @@ public sealed class ConfigService
     private const string PreferencesFileName = "preferences.json";
     private const string ClientConfigFileName = "trusttunnel_client.toml";
 
-    private static readonly object ReplaceSync = new();
+    /// <summary>
+    /// Serializes reads and writes of Veil's state files. Pages re-read the configuration whenever it changes,
+    /// and Windows refuses to replace a file another handle has open; a reader that fails then silently falls
+    /// back to the backup or to defaults, which a later save would persist.
+    /// </summary>
+    private static readonly SemaphoreSlim FileLock = new(1, 1);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -406,17 +411,42 @@ public sealed class ConfigService
         (File.Exists(Path.Combine(directory, "trusttunnel_client.exe")) ||
          File.Exists(Path.Combine(directory, "trusttunnel.exe")));
 
-    /// <summary>
-    /// Pages re-read the configuration whenever it changes; allowing delete sharing lets a concurrent
-    /// save replace the file instead of failing with "file in use".
-    /// </summary>
+    // Delete sharing keeps external readers (backup tools, editors) from blocking a save.
     private static FileStream OpenSharedRead(string path) =>
         new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 4096, useAsync: true);
+
+    private static async Task<T> WithFileLockAsync<T>(Func<Task<T>> action)
+    {
+        await FileLock.WaitAsync();
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            FileLock.Release();
+        }
+    }
+
+    private static Task<T> ReadJsonAsync<T>(string path, Func<JsonElement, T> map) =>
+        WithFileLockAsync(async () =>
+        {
+            await using var stream = OpenSharedRead(path);
+            using var document = await JsonDocument.ParseAsync(stream);
+            return map(document.RootElement);
+        });
 
     private static Task WriteJsonFileAtomicAsync<T>(string path, T value) =>
         WriteJsonFileAtomicAsync(path, value, createBackup: true);
 
-    private static async Task WriteJsonFileAtomicAsync<T>(string path, T value, bool createBackup)
+    private static Task WriteJsonFileAtomicAsync<T>(string path, T value, bool createBackup) =>
+        WithFileLockAsync(async () =>
+        {
+            await WriteJsonFileUnlockedAsync(path, value, createBackup);
+            return true;
+        });
+
+    private static async Task WriteJsonFileUnlockedAsync<T>(string path, T value, bool createBackup)
     {
         var stream = CreateTemporaryFile(path, out var tempPath);
         try
@@ -433,7 +463,14 @@ public sealed class ConfigService
         }
     }
 
-    private static async Task WriteTextFileAtomicAsync(string path, string content)
+    private static Task WriteTextFileAtomicAsync(string path, string content) =>
+        WithFileLockAsync(async () =>
+        {
+            await WriteTextFileUnlockedAsync(path, content);
+            return true;
+        });
+
+    private static async Task WriteTextFileUnlockedAsync(string path, string content)
     {
         var stream = CreateTemporaryFile(path, out var tempPath);
         try
@@ -476,35 +513,31 @@ public sealed class ConfigService
 
     private static void ReplaceFile(string tempPath, string targetPath, bool createBackup)
     {
-        // Saves from different pages can overlap; replacing one file concurrently fails on Windows.
-        lock (ReplaceSync)
+        for (var attempt = 1; ; attempt++)
         {
-            for (var attempt = 1; ; attempt++)
+            try
             {
-                try
-                {
-                    ReplaceFileOnce(tempPath, targetPath, createBackup);
-                    return;
-                }
-                catch (IOException) when (attempt < 5)
-                {
-                    // Antivirus scanners and indexers briefly lock freshly written files.
-                    Thread.Sleep(40 * attempt);
-                }
+                ReplaceFileOnce(tempPath, targetPath, createBackup);
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 5)
+            {
+                // Antivirus scanners and indexers briefly lock freshly written files.
+                Thread.Sleep(40 * attempt);
             }
         }
     }
 
     private static void ReplaceFileOnce(string tempPath, string targetPath, bool createBackup)
     {
-        // File.Replace fails while any reader has the target open, even with delete sharing. A copy for the
-        // backup plus a replacing rename (MoveFileEx) works alongside such readers and is still atomic.
-        if (createBackup && File.Exists(targetPath))
+        if (File.Exists(targetPath))
         {
-            File.Copy(targetPath, BackupPathFor(targetPath), overwrite: true);
+            File.Replace(tempPath, targetPath, createBackup ? BackupPathFor(targetPath) : null);
         }
-
-        File.Move(tempPath, targetPath, overwrite: true);
+        else
+        {
+            File.Move(tempPath, targetPath);
+        }
     }
 
     private static async Task<T> ReadJsonFileWithBackupAsync<T>(string path, Func<T> defaultFactory)
@@ -567,12 +600,8 @@ public sealed class ConfigService
         return ServerSetupConfig.DefaultConfig();
     }
 
-    private static async Task<ServerSetupConfig> ReadServerSetupConfigFileAsync(string path)
-    {
-        await using var stream = OpenSharedRead(path);
-        using var document = await JsonDocument.ParseAsync(stream);
-        return ServerSetupConfig.FromJsonElement(document.RootElement);
-    }
+    private static Task<ServerSetupConfig> ReadServerSetupConfigFileAsync(string path) =>
+        ReadJsonAsync(path, ServerSetupConfig.FromJsonElement);
 
     private static async Task<ServerSetupConfig?> TryReadServerSetupConfigFileAsync(string path)
     {
@@ -591,12 +620,8 @@ public sealed class ConfigService
         }
     }
 
-    private static async Task<DomainGroupsData> ReadDomainGroupsFileAsync(string path)
-    {
-        await using var stream = OpenSharedRead(path);
-        using var document = await JsonDocument.ParseAsync(stream);
-        return DomainGroupsData.FromJsonElement(document.RootElement);
-    }
+    private static Task<DomainGroupsData> ReadDomainGroupsFileAsync(string path) =>
+        ReadJsonAsync(path, DomainGroupsData.FromJsonElement);
 
     private static async Task<DomainGroupsData?> TryReadDomainGroupsFileAsync(string path)
     {
@@ -615,12 +640,8 @@ public sealed class ConfigService
         }
     }
 
-    private static async Task<ServerConfig> ReadServerConfigFileAsync(string path)
-    {
-        await using var stream = OpenSharedRead(path);
-        using var document = await JsonDocument.ParseAsync(stream);
-        return ServerConfig.FromJsonElement(document.RootElement);
-    }
+    private static Task<ServerConfig> ReadServerConfigFileAsync(string path) =>
+        ReadJsonAsync(path, ServerConfig.FromJsonElement);
 
     private static async Task<ServerConfig?> TryReadServerConfigFileAsync(string path)
     {
@@ -648,8 +669,11 @@ public sealed class ConfigService
                 return default;
             }
 
-            await using var stream = OpenSharedRead(path);
-            return await JsonSerializer.DeserializeAsync<T>(stream, JsonOptions);
+            return await WithFileLockAsync(async () =>
+            {
+                await using var stream = OpenSharedRead(path);
+                return await JsonSerializer.DeserializeAsync<T>(stream, JsonOptions);
+            });
         }
         catch
         {

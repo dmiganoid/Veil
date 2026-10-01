@@ -2118,7 +2118,9 @@ public static class Program
                 }
                 else
                 {
-                    await service.LoadConfigAsync();
+                    // A read racing a save must see a saved file, never fall back to defaults.
+                    var loaded = await service.LoadConfigAsync();
+                    Assert(loaded.Password == "secret", "A read during a save returned default settings.");
                     await service.LoadDomainGroupsAsync();
                 }
             }));
