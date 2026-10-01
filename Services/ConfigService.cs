@@ -497,14 +497,14 @@ public sealed class ConfigService
 
     private static void ReplaceFileOnce(string tempPath, string targetPath, bool createBackup)
     {
-        if (File.Exists(targetPath))
+        // File.Replace fails while any reader has the target open, even with delete sharing. A copy for the
+        // backup plus a replacing rename (MoveFileEx) works alongside such readers and is still atomic.
+        if (createBackup && File.Exists(targetPath))
         {
-            File.Replace(tempPath, targetPath, createBackup ? BackupPathFor(targetPath) : null);
+            File.Copy(targetPath, BackupPathFor(targetPath), overwrite: true);
         }
-        else
-        {
-            File.Move(tempPath, targetPath);
-        }
+
+        File.Move(tempPath, targetPath, overwrite: true);
     }
 
     private static async Task<T> ReadJsonFileWithBackupAsync<T>(string path, Func<T> defaultFactory)
