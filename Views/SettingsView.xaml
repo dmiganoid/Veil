@@ -1,0 +1,231 @@
+<UserControl x:Class="Veil.Views.SettingsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:ui="clr-namespace:Veil.Ui">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Header -->
+        <Grid Margin="32,4,32,16" MaxWidth="920">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+                <TextBlock Text="Connection" Style="{StaticResource PageTitle}" />
+                <TextBlock Text="Server credentials and tunnel options. Changes take effect the next time you connect." Style="{StaticResource PageSubtitle}" />
+            </StackPanel>
+            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Bottom">
+                <TextBlock x:Name="DirtyText" Text="Unsaved changes" Foreground="{StaticResource WarningBrush}" FontSize="12" FontWeight="SemiBold"
+                           VerticalAlignment="Center" Margin="0,0,14,0" Visibility="Collapsed" />
+                <Button x:Name="ImportButton" Click="ImportButton_Click" ToolTip="Load settings from a JSON file">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE8E5;" Style="{StaticResource Icon}" FontSize="13" />
+                        <TextBlock Text="Import" Margin="8,0,0,0" />
+                    </StackPanel>
+                </Button>
+                <Button x:Name="ExportButton" Click="ExportButton_Click" Margin="8,0,0,0" ToolTip="Save settings to a JSON file">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xEDE1;" Style="{StaticResource Icon}" FontSize="13" />
+                        <TextBlock Text="Export" Margin="8,0,0,0" />
+                    </StackPanel>
+                </Button>
+                <Button x:Name="SaveButton" Click="SaveButton_Click" Margin="8,0,0,0" MinWidth="96" Style="{StaticResource PrimaryButton}">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE74E;" Style="{StaticResource Icon}" FontSize="13" />
+                        <TextBlock Text="Save" Margin="8,0,0,0" />
+                    </StackPanel>
+                </Button>
+            </StackPanel>
+        </Grid>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel x:Name="FormPanel" Margin="32,0,32,28" MaxWidth="920">
+                <Border x:Name="ReconnectNotice" Style="{StaticResource NoticeBorder}" Margin="0,0,0,16" Visibility="Collapsed">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="&#xE946;" Style="{StaticResource Icon}" Foreground="{StaticResource WarningBrush}" />
+                        <TextBlock Grid.Column="1" Text="Veil is connected. Saved changes take effect after you reconnect." Margin="10,0,12,0" VerticalAlignment="Center" TextWrapping="Wrap" />
+                        <Button x:Name="ReconnectButton" Grid.Column="2" Content="Reconnect" MinHeight="28" Click="ReconnectButton_Click" />
+                    </Grid>
+                </Border>
+
+                <!-- Server -->
+                <Border x:Name="ServerCard" Style="{StaticResource Card}">
+                    <StackPanel>
+                        <TextBlock Text="Server" Style="{StaticResource SectionTitle}" />
+                        <TextBlock Text="The values from your TrustTunnel endpoint. The address is used to connect; the hostname is checked against the server certificate." Style="{StaticResource SectionHint}" />
+                        <Grid Margin="0,16,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="16" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="16" />
+                                <ColumnDefinition Width="110" />
+                            </Grid.ColumnDefinitions>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="14" />
+                                <RowDefinition Height="Auto" />
+                            </Grid.RowDefinitions>
+
+                            <StackPanel>
+                                <TextBlock Text="Hostname" Style="{StaticResource FieldLabel}" />
+                                <TextBox x:Name="HostnameTextBox" Tag="vpn.example.com" TextChanged="Field_Changed" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="IP address" Style="{StaticResource FieldLabel}" />
+                                <TextBox x:Name="AddressTextBox" Tag="203.0.113.10" TextChanged="Field_Changed" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="4">
+                                <TextBlock Text="Port" Style="{StaticResource FieldLabel}" />
+                                <TextBox x:Name="PortTextBox" Tag="443" TextChanged="Field_Changed" />
+                            </StackPanel>
+
+                            <StackPanel Grid.Row="2">
+                                <TextBlock Text="Username" Style="{StaticResource FieldLabel}" />
+                                <TextBox x:Name="UsernameTextBox" TextChanged="Field_Changed" />
+                            </StackPanel>
+                            <StackPanel Grid.Row="2" Grid.Column="2" Grid.ColumnSpan="3">
+                                <TextBlock Text="Password" Style="{StaticResource FieldLabel}" />
+                                <ui:PasswordField x:Name="PasswordField" PasswordChanged="PasswordField_Changed" />
+                            </StackPanel>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <!-- Tunnel -->
+                <Border x:Name="TunnelCard" Style="{StaticResource Card}" Margin="0,16,0,0">
+                    <StackPanel>
+                        <TextBlock Text="Tunnel" Style="{StaticResource SectionTitle}" />
+                        <Grid Margin="0,14,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="12" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <RadioButton x:Name="FullTunnelOption" Style="{StaticResource OptionCard}" GroupName="ConnectionMode" Checked="Field_Changed">
+                                <StackPanel>
+                                    <TextBlock Text="Full tunnel" FontWeight="SemiBold" />
+                                    <TextBlock Text="Every app goes through a virtual network adapter. Routing rules apply. Recommended." Style="{StaticResource SectionHint}" />
+                                </StackPanel>
+                            </RadioButton>
+                            <RadioButton x:Name="SystemProxyOption" Grid.Column="2" Style="{StaticResource OptionCard}" GroupName="ConnectionMode" Checked="Field_Changed">
+                                <StackPanel>
+                                    <TextBlock Text="System proxy" FontWeight="SemiBold" />
+                                    <TextBlock Text="Only browsers and other proxy-aware apps. Can be faster for downloads, but no UDP, ping or routing rules." Style="{StaticResource SectionHint}" />
+                                </StackPanel>
+                            </RadioButton>
+                        </Grid>
+
+                        <Grid Margin="0,16,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="16" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="16" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel>
+                                <TextBlock Text="Protocol" Style="{StaticResource FieldLabel}" />
+                                <ComboBox x:Name="ProtocolComboBox" SelectionChanged="Field_Changed">
+                                    <ComboBoxItem Content="HTTP/2" Tag="http2" />
+                                    <ComboBoxItem Content="HTTP/3 (QUIC)" Tag="http3" />
+                                </ComboBox>
+                            </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="DNS server" Style="{StaticResource FieldLabel}" />
+                                <TextBox x:Name="DnsTextBox" Tag="8.8.8.8 or https://dns.example/dns-query" TextChanged="Field_Changed"
+                                         ToolTip="Plain DNS (8.8.8.8), DNS-over-TLS (tls://…), DNS-over-HTTPS (https://…) or DNS-over-QUIC (quic://…)" />
+                            </StackPanel>
+                            <StackPanel Grid.Column="4">
+                                <TextBlock Text="Custom SNI" Style="{StaticResource FieldLabel}" />
+                                <TextBox x:Name="CustomSniTextBox" Tag="Same as hostname" TextChanged="Field_Changed"
+                                         ToolTip="Server name sent in the TLS handshake. Leave empty to use the hostname." />
+                            </StackPanel>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <!-- Advanced -->
+                <Border x:Name="AdvancedCard" Style="{StaticResource Card}" Margin="0,16,0,0" Padding="18,14">
+                    <StackPanel>
+                        <TextBlock Text="Advanced" Style="{StaticResource SectionTitle}" Margin="0,4,0,6" />
+
+                        <CheckBox x:Name="Ipv6Switch" Style="{StaticResource SwitchCheckBox}" Margin="0,8" Checked="Field_Changed" Unchecked="Field_Changed">
+                            <StackPanel>
+                                <TextBlock Text="IPv6" />
+                                <TextBlock Text="Route IPv6 traffic through the tunnel. Turn off if the server has no IPv6." Style="{StaticResource SectionHint}" />
+                            </StackPanel>
+                        </CheckBox>
+                        <Border Height="1" Background="{StaticResource BorderBrush}" />
+                        <CheckBox x:Name="AntiDpiSwitch" Style="{StaticResource SwitchCheckBox}" Margin="0,8" Checked="Field_Changed" Unchecked="Field_Changed">
+                            <StackPanel>
+                                <TextBlock Text="Anti-DPI" />
+                                <TextBlock Text="Shape the handshake to get past deep packet inspection." Style="{StaticResource SectionHint}" />
+                            </StackPanel>
+                        </CheckBox>
+                        <Border Height="1" Background="{StaticResource BorderBrush}" />
+                        <CheckBox x:Name="PostQuantumSwitch" Style="{StaticResource SwitchCheckBox}" Margin="0,8" Checked="Field_Changed" Unchecked="Field_Changed">
+                            <StackPanel>
+                                <TextBlock Text="Post-quantum key exchange" />
+                                <TextBlock Text="Use a hybrid post-quantum TLS key exchange with the server." Style="{StaticResource SectionHint}" />
+                            </StackPanel>
+                        </CheckBox>
+                        <Border Height="1" Background="{StaticResource BorderBrush}" />
+                        <CheckBox x:Name="SkipVerificationSwitch" Style="{StaticResource SwitchCheckBox}" Margin="0,8" Checked="Field_Changed" Unchecked="Field_Changed">
+                            <StackPanel>
+                                <TextBlock Text="Skip certificate verification" />
+                                <TextBlock Text="Not recommended: anyone between you and the server could read your traffic." Style="{StaticResource SectionHint}" Foreground="{StaticResource WarningBrush}" />
+                            </StackPanel>
+                        </CheckBox>
+                        <Border Height="1" Background="{StaticResource BorderBrush}" />
+                        <Grid Margin="0,10,0,4">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="160" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel VerticalAlignment="Center">
+                                <TextBlock Text="Engine log level" />
+                                <TextBlock Text="Use debug or trace only while troubleshooting." Style="{StaticResource SectionHint}" />
+                            </StackPanel>
+                            <ComboBox x:Name="LogLevelComboBox" Grid.Column="1" VerticalAlignment="Center" SelectionChanged="Field_Changed">
+                                <ComboBoxItem Content="error" Tag="error" />
+                                <ComboBoxItem Content="warn" Tag="warn" />
+                                <ComboBoxItem Content="info" Tag="info" />
+                                <ComboBoxItem Content="debug" Tag="debug" />
+                                <ComboBoxItem Content="trace" Tag="trace" />
+                            </ComboBox>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <!-- Application -->
+                <Border Style="{StaticResource Card}" Margin="0,16,0,0">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="220" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel VerticalAlignment="Center">
+                            <TextBlock Text="Closing the window" Style="{StaticResource SectionTitle}" />
+                            <TextBlock Text="What the close button does. Exit is always available from the tray icon menu." Style="{StaticResource SectionHint}" />
+                        </StackPanel>
+                        <ComboBox x:Name="CloseActionComboBox" Grid.Column="1" VerticalAlignment="Center" SelectionChanged="CloseActionComboBox_SelectionChanged">
+                            <ComboBoxItem Content="Ask every time" Tag="Ask" />
+                            <ComboBoxItem Content="Keep running in the tray" Tag="MinimizeToTray" />
+                            <ComboBoxItem Content="Exit Veil" Tag="Exit" />
+                        </ComboBox>
+                    </Grid>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</UserControl>

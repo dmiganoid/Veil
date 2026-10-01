@@ -13,13 +13,25 @@ public sealed class DomainGroup
     public override string ToString() => $"{Name} ({Domains.Count})";
 }
 
+/// <summary>
+/// Result of the related-domains dialog: either a group of the selected domains or the domain alone.
+/// </summary>
+public sealed record DomainDiscoveryChoice(bool CreateGroup, string GroupName, List<string> Domains);
+
+/// <summary>
+/// Domain routing rules edited on the Routing page.
+/// Rules (groups and standalone entries) follow the routing mode: they bypass the VPN in General mode
+/// and use it in Selective mode. Exceptions take the opposite route and override broader rules,
+/// e.g. the rule <c>*.net</c> with the exception <c>example.net</c>.
+/// </summary>
 public sealed class DomainGroupsData
 {
-    public const int CurrentVersion = 1;
+    public const int CurrentVersion = 2;
 
     public int Version { get; set; } = CurrentVersion;
     public List<DomainGroup> Groups { get; set; } = [];
     public List<string> StandaloneDomains { get; set; } = [];
+    public List<string> ExceptionDomains { get; set; } = [];
 
     public static DomainGroupsData FromJsonElement(JsonElement json)
     {
@@ -30,9 +42,10 @@ public sealed class DomainGroupsData
 
         return new DomainGroupsData
         {
-            Version = GetInt(json, "version", CurrentVersion),
-            Groups = GetGroups(json, "groups"),
-            StandaloneDomains = GetStringList(json, "standaloneDomains")
+            Version = JsonFields.StrictInt(json, "version", CurrentVersion),
+            Groups = ReadGroups(json, "groups"),
+            StandaloneDomains = JsonFields.StrictStringList(json, "standaloneDomains"),
+            ExceptionDomains = JsonFields.StrictStringList(json, "exceptionDomains")
         };
     }
 
@@ -41,18 +54,7 @@ public sealed class DomainGroupsData
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var domains = new List<string>();
 
-        foreach (var group in Groups)
-        {
-            foreach (var domain in group.Domains.Select(CleanDomain))
-            {
-                if (domain.Length > 0 && seen.Add(domain))
-                {
-                    domains.Add(domain);
-                }
-            }
-        }
-
-        foreach (var domain in StandaloneDomains.Select(CleanDomain))
+        foreach (var domain in Groups.SelectMany(group => group.Domains).Concat(StandaloneDomains).Select(CleanDomain))
         {
             if (domain.Length > 0 && seen.Add(domain))
             {
@@ -63,13 +65,26 @@ public sealed class DomainGroupsData
         return domains;
     }
 
+    public List<string> FlattenExceptions()
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        return ExceptionDomains
+            .Select(CleanException)
+            .Where(domain => domain.Length > 0 && seen.Add(domain))
+            .ToList();
+    }
+
     public DomainGroupsData NormalizeEntries()
     {
         var normalized = new DomainGroupsData
         {
-            Version = Version
+            Version = CurrentVersion,
+            ExceptionDomains = FlattenExceptions()
         };
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // A pattern cannot be a rule and an exception at once; the engine lets the exception win,
+        // so drop the rule to keep the list truthful.
+        var seen = new HashSet<string>(normalized.ExceptionDomains, StringComparer.OrdinalIgnoreCase);
 
         foreach (var group in Groups)
         {
@@ -113,6 +128,13 @@ public sealed class DomainGroupsData
                FlattenDomains().Any(item => item.Equals(domain, StringComparison.OrdinalIgnoreCase));
     }
 
+    public bool ContainsException(string domain)
+    {
+        domain = CleanException(domain);
+        return domain.Length > 0 &&
+               ExceptionDomains.Any(item => CleanException(item).Equals(domain, StringComparison.OrdinalIgnoreCase));
+    }
+
     public bool AddStandaloneDomain(string domain)
     {
         domain = CleanDomain(domain);
@@ -121,8 +143,44 @@ public sealed class DomainGroupsData
             return false;
         }
 
+        RemoveException(domain);
         StandaloneDomains.Add(domain);
         return true;
+    }
+
+    public bool RemoveStandaloneDomain(string domain) =>
+        StandaloneDomains.RemoveAll(item => CleanDomain(item).Equals(CleanDomain(domain), StringComparison.OrdinalIgnoreCase)) > 0;
+
+    /// <summary>
+    /// Adds a domain exception. A standalone rule for the same pattern is replaced, because an exception
+    /// and a rule for one pattern cannot both apply.
+    /// </summary>
+    public bool AddException(string domain)
+    {
+        domain = CleanException(domain);
+        if (domain.Length == 0 || ContainsException(domain))
+        {
+            return false;
+        }
+
+        RemoveStandaloneDomain(domain);
+        ExceptionDomains.Add(domain);
+        return true;
+    }
+
+    public bool RemoveException(string domain) =>
+        ExceptionDomains.RemoveAll(item => CleanException(item).Equals(CleanException(domain), StringComparison.OrdinalIgnoreCase)) > 0;
+
+    /// <summary>
+    /// Returns the rules that an exception overrides. An exception without covering rules has no effect.
+    /// </summary>
+    public List<string> RulesOverriddenBy(string exception)
+    {
+        exception = CleanException(exception);
+        return FlattenDomains()
+            .Where(rule => !rule.Equals(exception, StringComparison.OrdinalIgnoreCase) &&
+                           SplitTunnelEntry.Covers(rule, exception))
+            .ToList();
     }
 
     public bool AddDomainToGroup(DomainGroup group, string domain)
@@ -134,6 +192,7 @@ public sealed class DomainGroupsData
             return false;
         }
 
+        RemoveException(domain);
         trackedGroup.Domains.Add(domain);
         return true;
     }
@@ -162,6 +221,28 @@ public sealed class DomainGroupsData
         return AddStandaloneDomain(normalizedPrimary);
     }
 
+    /// <summary>
+    /// Applies the user's choice from the related-domains dialog. Returns false when the user cancelled.
+    /// </summary>
+    public bool ApplyDiscoveryChoice(string domain, DomainDiscoveryChoice? choice)
+    {
+        if (choice == null)
+        {
+            return false;
+        }
+
+        if (choice.CreateGroup)
+        {
+            AddDiscoveryResult(domain, true, choice.GroupName, choice.Domains);
+        }
+        else
+        {
+            AddStandaloneDomain(domain);
+        }
+
+        return true;
+    }
+
     public DomainGroup? AddGroup(string name, string primaryDomain, IEnumerable<string> domains)
     {
         var seen = new HashSet<string>(FlattenDomains(), StringComparer.OrdinalIgnoreCase);
@@ -180,6 +261,11 @@ public sealed class DomainGroupsData
             return null;
         }
 
+        foreach (var domain in groupDomains)
+        {
+            RemoveException(domain);
+        }
+
         var effectivePrimaryDomain = PrimaryDomainFromDomains(normalizedPrimaryDomain, groupDomains);
         var group = new DomainGroup
         {
@@ -190,6 +276,12 @@ public sealed class DomainGroupsData
         };
         Groups.Add(group);
         return group;
+    }
+
+    public bool RemoveGroup(DomainGroup group)
+    {
+        var trackedGroup = FindTrackedGroup(group);
+        return trackedGroup != null && Groups.Remove(trackedGroup);
     }
 
     public bool RemoveDomainFromGroup(DomainGroup group, string domain)
@@ -210,7 +302,7 @@ public sealed class DomainGroupsData
         return removed;
     }
 
-    private DomainGroup? FindTrackedGroup(DomainGroup group) =>
+    public DomainGroup? FindTrackedGroup(DomainGroup group) =>
         Groups.FirstOrDefault(candidate =>
             ReferenceEquals(candidate, group) ||
             (!string.IsNullOrWhiteSpace(candidate.Id) &&
@@ -218,14 +310,18 @@ public sealed class DomainGroupsData
 
     private static string CleanDomain(string domain) => SplitTunnelEntry.Normalize(domain);
 
+    /// <summary>Normalized exception pattern, or "" for entries the engine cannot use as exceptions.</summary>
+    private static string CleanException(string domain) =>
+        SplitTunnelEntry.TryNormalizeException(domain, out var exception) ? exception : "";
+
     private static string PrimaryDomainFromDomains(string primaryDomain, IReadOnlyList<string> domains) =>
         primaryDomain.Length > 0 && domains.Contains(primaryDomain, StringComparer.OrdinalIgnoreCase)
             ? primaryDomain
             : domains[0];
 
-    private static List<DomainGroup> GetGroups(JsonElement json, string name)
+    private static List<DomainGroup> ReadGroups(JsonElement json, string name)
     {
-        if (!TryGetProperty(json, name, out var value) || value.ValueKind == JsonValueKind.Null)
+        if (!JsonFields.TryGet(json, name, out var value) || value.ValueKind == JsonValueKind.Null)
         {
             return [];
         }
@@ -249,73 +345,10 @@ public sealed class DomainGroupsData
 
         return new DomainGroup
         {
-            Id = GetRequiredString(json, "id"),
-            Name = GetRequiredString(json, "name"),
-            PrimaryDomain = GetRequiredString(json, "primaryDomain"),
-            Domains = GetStringList(json, "domains")
+            Id = JsonFields.RequiredString(json, "id"),
+            Name = JsonFields.RequiredString(json, "name"),
+            PrimaryDomain = JsonFields.RequiredString(json, "primaryDomain"),
+            Domains = JsonFields.StrictStringList(json, "domains")
         };
-    }
-
-    private static int GetInt(JsonElement json, string name, int fallback)
-    {
-        if (!TryGetProperty(json, name, out var value) || value.ValueKind == JsonValueKind.Null)
-        {
-            return fallback;
-        }
-
-        return value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number)
-            ? number
-            : throw new InvalidDataException($"{name} must be a number.");
-    }
-
-    private static string GetRequiredString(JsonElement json, string name)
-    {
-        return TryGetProperty(json, name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString() ?? ""
-            : throw new InvalidDataException($"{name} must be a string.");
-    }
-
-    private static List<string> GetStringList(JsonElement json, string name)
-    {
-        if (!TryGetProperty(json, name, out var value) || value.ValueKind == JsonValueKind.Null)
-        {
-            return [];
-        }
-
-        if (value.ValueKind != JsonValueKind.Array)
-        {
-            throw new InvalidDataException($"{name} must be an array.");
-        }
-
-        var result = new List<string>();
-        foreach (var item in value.EnumerateArray())
-        {
-            if (item.ValueKind != JsonValueKind.String)
-            {
-                throw new InvalidDataException($"{name} entries must be strings.");
-            }
-
-            result.Add(item.GetString() ?? "");
-        }
-
-        return result;
-    }
-
-    private static bool TryGetProperty(JsonElement json, string name, out JsonElement value)
-    {
-        if (json.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var property in json.EnumerateObject())
-            {
-                if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    value = property.Value;
-                    return true;
-                }
-            }
-        }
-
-        value = default;
-        return false;
     }
 }

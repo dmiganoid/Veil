@@ -1,4 +1,5 @@
 using System.IO;
+using System.Threading;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Veil.Models;
@@ -10,7 +11,15 @@ public sealed class ConfigService
     private const string ConfigFileName = "config.json";
     private const string DomainGroupsFileName = "domain_groups.json";
     private const string ServerSetupConfigFileName = "server_setup_config.json";
+    private const string PreferencesFileName = "preferences.json";
     private const string ClientConfigFileName = "trusttunnel_client.toml";
+
+    /// <summary>
+    /// Serializes reads and writes of Veil's state files. Pages re-read the configuration whenever it changes,
+    /// and Windows refuses to replace a file another handle has open; a reader that fails then silently falls
+    /// back to the backup or to defaults, which a later save would persist.
+    /// </summary>
+    private static readonly SemaphoreSlim FileLock = new(1, 1);
 
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -53,7 +62,7 @@ public sealed class ConfigService
             await WriteJsonFileAtomicAsync(path, runtimeConfig);
 
             var domainGroups = legacyState.DomainGroups ??
-                               CreateDomainGroupsFromFlatDomains(runtimeConfig.SplitTunnelDomains);
+                               CreateDomainGroupsFromConfig(runtimeConfig);
             await SaveDomainGroupsAsync(domainGroups);
             ConfigChanged?.Invoke(this, EventArgs.Empty);
             return runtimeConfig;
@@ -96,16 +105,18 @@ public sealed class ConfigService
         IEnumerable<string> selectedApps,
         IEnumerable<string>? selectedCountries = null)
     {
+        // Snapshot the caller's collections before the first await; they are owned by the UI.
         var normalizedDomainGroups = domainGroups.NormalizeEntries();
+        var apps = NormalizeSplitTunnelApps(selectedApps);
+        var countries = selectedCountries == null ? null : NormalizeSplitTunnelCountries(selectedCountries);
         await SaveDomainGroupsAsync(normalizedDomainGroups);
 
         var config = await LoadConfigAsync();
         config.VpnMode = vpnMode;
         config.SplitTunnelDomains = normalizedDomainGroups.FlattenDomains();
-        config.SplitTunnelApps = NormalizeSplitTunnelApps(selectedApps);
-        config.SplitTunnelCountries = selectedCountries == null
-            ? NormalizeSplitTunnelCountries(config.SplitTunnelCountries)
-            : NormalizeSplitTunnelCountries(selectedCountries);
+        config.SplitTunnelExceptions = normalizedDomainGroups.FlattenExceptions();
+        config.SplitTunnelApps = apps;
+        config.SplitTunnelCountries = countries ?? NormalizeSplitTunnelCountries(config.SplitTunnelCountries);
 
         await SaveConfigAsync(config);
         return config;
@@ -115,6 +126,15 @@ public sealed class ConfigService
     {
         var path = Path.Combine(AppDataDirectory, ServerSetupConfigFileName);
         return (await ReadServerSetupConfigWithBackupAsync(path)).NormalizePersistedDraft();
+    }
+
+    public Task<AppPreferences> LoadPreferencesAsync() =>
+        ReadJsonFileWithBackupAsync(Path.Combine(AppDataDirectory, PreferencesFileName), () => new AppPreferences());
+
+    public async Task SavePreferencesAsync(AppPreferences preferences)
+    {
+        Directory.CreateDirectory(AppDataDirectory);
+        await WriteJsonFileAtomicAsync(Path.Combine(AppDataDirectory, PreferencesFileName), preferences);
     }
 
     public async Task SaveServerSetupConfigAsync(ServerSetupConfig config)
@@ -133,12 +153,9 @@ public sealed class ConfigService
         }
 
         var config = await LoadConfigAsync();
-        var data = new DomainGroupsData
-        {
-            StandaloneDomains = config.SplitTunnelDomains.ToList()
-        }.NormalizeEntries();
+        var data = CreateDomainGroupsFromConfig(config);
 
-        if (data.StandaloneDomains.Count > 0)
+        if (data.StandaloneDomains.Count > 0 || data.ExceptionDomains.Count > 0)
         {
             await SaveDomainGroupsAsync(data);
         }
@@ -149,12 +166,14 @@ public sealed class ConfigService
     public async Task<ServerConfig> ImportConfigAndPersistAsync(string filePath)
     {
         var config = await ImportConfigAsync(filePath);
-        var importedGroups = CreateDomainGroupsFromFlatDomains(config.SplitTunnelDomains);
+        var importedGroups = CreateDomainGroupsFromConfig(config);
         config.SplitTunnelDomains = importedGroups.StandaloneDomains.ToList();
+        config.SplitTunnelExceptions = importedGroups.ExceptionDomains.ToList();
         var runtimeConfig = NormalizeConfigRuntimeState(config);
 
-        await SaveConfigAsync(runtimeConfig);
+        // Domain groups first: saving config.json raises ConfigChanged, and listeners re-read both files.
         await SaveDomainGroupsAsync(importedGroups);
+        await SaveConfigAsync(runtimeConfig);
         return runtimeConfig;
     }
 
@@ -190,16 +209,40 @@ public sealed class ConfigService
         return File.Exists(exe);
     }
 
-    public async Task<string> GetConfigFilePathAsync()
+    /// <summary>
+    /// The engine configuration contains the VPN password, so it lives in the user's profile rather than
+    /// next to the executable, where every local user could read it in a Program Files install.
+    /// </summary>
+    public Task<string> GetConfigFilePathAsync()
     {
-        var clientDir = await GetClientDirectoryAsync();
-        return Path.Combine(clientDir, ClientConfigFileName);
+        Directory.CreateDirectory(AppDataDirectory);
+        return Task.FromResult(Path.Combine(AppDataDirectory, ClientConfigFileName));
     }
 
     public async Task WriteConfigFileAsync(ServerConfig config, IEnumerable<string>? runtimeExclusions = null)
     {
         var configPath = await GetConfigFilePathAsync();
         await WriteTextFileAtomicAsync(configPath, config.ToToml(runtimeExclusions));
+        await DeleteLegacyClientConfigAsync();
+    }
+
+    /// <summary>
+    /// Versions before 0.2 wrote the engine configuration, including the password, next to the engine.
+    /// </summary>
+    private async Task DeleteLegacyClientConfigAsync()
+    {
+        try
+        {
+            var legacyPath = Path.Combine(await GetClientDirectoryAsync(), ClientConfigFileName);
+            if (File.Exists(legacyPath))
+            {
+                File.Delete(legacyPath);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Best effort: the file is no longer read by Veil.
+        }
     }
 
     public async Task ExportConfigAsync(ServerConfig config, string filePath)
@@ -212,42 +255,21 @@ public sealed class ConfigService
         return await ReadServerConfigFileAsync(filePath);
     }
 
-    private static DomainGroupsData CreateDomainGroupsFromFlatDomains(IEnumerable<string> domains)
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var standaloneDomains = domains
-            .Select(SplitTunnelEntry.Normalize)
-            .Where(domain => domain.Length > 0 && seen.Add(domain))
-            .ToList();
-
-        return new DomainGroupsData
+    private static DomainGroupsData CreateDomainGroupsFromConfig(ServerConfig config) =>
+        new DomainGroupsData
         {
-            StandaloneDomains = standaloneDomains
-        };
-    }
+            StandaloneDomains = config.SplitTunnelDomains.ToList(),
+            ExceptionDomains = config.SplitTunnelExceptions.ToList()
+        }.NormalizeEntries();
 
     private static ServerConfig NormalizeConfigRuntimeState(ServerConfig config)
     {
-        return new ServerConfig
-        {
-            Hostname = config.Hostname,
-            Address = config.Address,
-            Port = config.Port,
-            HasIpv6 = config.HasIpv6,
-            Username = config.Username,
-            Password = config.Password,
-            SkipVerification = config.SkipVerification,
-            UpstreamProtocol = config.UpstreamProtocol,
-            AntiDpi = config.AntiDpi,
-            Dns = config.Dns,
-            LogLevel = config.LogLevel,
-            CustomSni = config.CustomSni,
-            PostQuantumGroupEnabled = config.PostQuantumGroupEnabled,
-            VpnMode = config.VpnMode,
-            SplitTunnelDomains = NormalizeSplitTunnelDomains(config.SplitTunnelDomains),
-            SplitTunnelApps = NormalizeSplitTunnelApps(config.SplitTunnelApps),
-            SplitTunnelCountries = NormalizeSplitTunnelCountries(config.SplitTunnelCountries)
-        };
+        var normalized = config.Clone();
+        normalized.SplitTunnelDomains = NormalizeSplitTunnelDomains(config.SplitTunnelDomains);
+        normalized.SplitTunnelExceptions = NormalizeSplitTunnelExceptions(config.SplitTunnelExceptions);
+        normalized.SplitTunnelApps = NormalizeSplitTunnelApps(config.SplitTunnelApps);
+        normalized.SplitTunnelCountries = NormalizeSplitTunnelCountries(config.SplitTunnelCountries);
+        return normalized;
     }
 
     private static List<string> NormalizeSplitTunnelDomains(IEnumerable<string> domains)
@@ -259,12 +281,27 @@ public sealed class ConfigService
             .ToList();
     }
 
-    private static List<string> NormalizeSplitTunnelApps(IEnumerable<string> apps)
+    private static List<string> NormalizeSplitTunnelExceptions(IEnumerable<string> exceptions)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>();
+        foreach (var entry in exceptions)
+        {
+            if (SplitTunnelEntry.TryNormalizeException(entry, out var exception) && seen.Add(exception))
+            {
+                result.Add(exception);
+            }
+        }
+
+        return result;
+    }
+
+    internal static List<string> NormalizeSplitTunnelApps(IEnumerable<string> apps)
     {
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         return apps
             .Where(app => !string.IsNullOrWhiteSpace(app))
-            .Select(ServerConfig.NormalizeSplitTunnelAppProcessName)
+            .Select(SplitTunnelEntry.NormalizeAppProcessName)
             .Where(app => app.Length > 0)
             .Where(app => seen.Add(app))
             .OrderBy(app => app, StringComparer.OrdinalIgnoreCase)
@@ -315,7 +352,7 @@ public sealed class ConfigService
 
         try
         {
-            await using var stream = File.OpenRead(path);
+            await using var stream = OpenSharedRead(path);
             using var document = await JsonDocument.ParseAsync(stream);
             if (!TryGetStringProperty(document.RootElement, "flutter.server_config", out var configJson))
             {
@@ -374,10 +411,42 @@ public sealed class ConfigService
         (File.Exists(Path.Combine(directory, "trusttunnel_client.exe")) ||
          File.Exists(Path.Combine(directory, "trusttunnel.exe")));
 
+    // Delete sharing keeps external readers (backup tools, editors) from blocking a save.
+    private static FileStream OpenSharedRead(string path) =>
+        new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, bufferSize: 4096, useAsync: true);
+
+    private static async Task<T> WithFileLockAsync<T>(Func<Task<T>> action)
+    {
+        await FileLock.WaitAsync();
+        try
+        {
+            return await action();
+        }
+        finally
+        {
+            FileLock.Release();
+        }
+    }
+
+    private static Task<T> ReadJsonAsync<T>(string path, Func<JsonElement, T> map) =>
+        WithFileLockAsync(async () =>
+        {
+            await using var stream = OpenSharedRead(path);
+            using var document = await JsonDocument.ParseAsync(stream);
+            return map(document.RootElement);
+        });
+
     private static Task WriteJsonFileAtomicAsync<T>(string path, T value) =>
         WriteJsonFileAtomicAsync(path, value, createBackup: true);
 
-    private static async Task WriteJsonFileAtomicAsync<T>(string path, T value, bool createBackup)
+    private static Task WriteJsonFileAtomicAsync<T>(string path, T value, bool createBackup) =>
+        WithFileLockAsync(async () =>
+        {
+            await WriteJsonFileUnlockedAsync(path, value, createBackup);
+            return true;
+        });
+
+    private static async Task WriteJsonFileUnlockedAsync<T>(string path, T value, bool createBackup)
     {
         var stream = CreateTemporaryFile(path, out var tempPath);
         try
@@ -394,7 +463,14 @@ public sealed class ConfigService
         }
     }
 
-    private static async Task WriteTextFileAtomicAsync(string path, string content)
+    private static Task WriteTextFileAtomicAsync(string path, string content) =>
+        WithFileLockAsync(async () =>
+        {
+            await WriteTextFileUnlockedAsync(path, content);
+            return true;
+        });
+
+    private static async Task WriteTextFileUnlockedAsync(string path, string content)
     {
         var stream = CreateTemporaryFile(path, out var tempPath);
         try
@@ -436,6 +512,23 @@ public sealed class ConfigService
     }
 
     private static void ReplaceFile(string tempPath, string targetPath, bool createBackup)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                ReplaceFileOnce(tempPath, targetPath, createBackup);
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException && attempt < 5)
+            {
+                // Antivirus scanners and indexers briefly lock freshly written files.
+                Thread.Sleep(40 * attempt);
+            }
+        }
+    }
+
+    private static void ReplaceFileOnce(string tempPath, string targetPath, bool createBackup)
     {
         if (File.Exists(targetPath))
         {
@@ -507,12 +600,8 @@ public sealed class ConfigService
         return ServerSetupConfig.DefaultConfig();
     }
 
-    private static async Task<ServerSetupConfig> ReadServerSetupConfigFileAsync(string path)
-    {
-        await using var stream = File.OpenRead(path);
-        using var document = await JsonDocument.ParseAsync(stream);
-        return ServerSetupConfig.FromJsonElement(document.RootElement);
-    }
+    private static Task<ServerSetupConfig> ReadServerSetupConfigFileAsync(string path) =>
+        ReadJsonAsync(path, ServerSetupConfig.FromJsonElement);
 
     private static async Task<ServerSetupConfig?> TryReadServerSetupConfigFileAsync(string path)
     {
@@ -531,12 +620,8 @@ public sealed class ConfigService
         }
     }
 
-    private static async Task<DomainGroupsData> ReadDomainGroupsFileAsync(string path)
-    {
-        await using var stream = File.OpenRead(path);
-        using var document = await JsonDocument.ParseAsync(stream);
-        return DomainGroupsData.FromJsonElement(document.RootElement);
-    }
+    private static Task<DomainGroupsData> ReadDomainGroupsFileAsync(string path) =>
+        ReadJsonAsync(path, DomainGroupsData.FromJsonElement);
 
     private static async Task<DomainGroupsData?> TryReadDomainGroupsFileAsync(string path)
     {
@@ -555,12 +640,8 @@ public sealed class ConfigService
         }
     }
 
-    private static async Task<ServerConfig> ReadServerConfigFileAsync(string path)
-    {
-        await using var stream = File.OpenRead(path);
-        using var document = await JsonDocument.ParseAsync(stream);
-        return ServerConfig.FromJsonElement(document.RootElement);
-    }
+    private static Task<ServerConfig> ReadServerConfigFileAsync(string path) =>
+        ReadJsonAsync(path, ServerConfig.FromJsonElement);
 
     private static async Task<ServerConfig?> TryReadServerConfigFileAsync(string path)
     {
@@ -588,8 +669,11 @@ public sealed class ConfigService
                 return default;
             }
 
-            await using var stream = File.OpenRead(path);
-            return await JsonSerializer.DeserializeAsync<T>(stream, JsonOptions);
+            return await WithFileLockAsync(async () =>
+            {
+                await using var stream = OpenSharedRead(path);
+                return await JsonSerializer.DeserializeAsync<T>(stream, JsonOptions);
+            });
         }
         catch
         {

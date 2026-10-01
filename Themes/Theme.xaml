@@ -1,0 +1,137 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <FontFamily x:Key="UiFont">pack://application:,,,/Veil;component/Assets/Fonts/#Manrope</FontFamily>
+    <FontFamily x:Key="MonoFont">Cascadia Mono, Consolas</FontFamily>
+    <FontFamily x:Key="IconFont">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
+
+    <Color x:Key="WindowColor">#0B0F17</Color>
+    <Color x:Key="SidebarColor">#0E131C</Color>
+    <Color x:Key="SurfaceColor">#131925</Color>
+    <Color x:Key="SurfaceRaisedColor">#1A2130</Color>
+    <Color x:Key="SurfaceHoverColor">#212A3B</Color>
+    <Color x:Key="InputColor">#0F141D</Color>
+    <Color x:Key="BorderColor">#232C3C</Color>
+    <Color x:Key="BorderStrongColor">#34405A</Color>
+    <Color x:Key="TextColor">#E7ECF4</Color>
+    <Color x:Key="MutedColor">#98A3B5</Color>
+    <Color x:Key="SubtleColor">#687489</Color>
+    <Color x:Key="AccentColor">#4C8DFF</Color>
+    <Color x:Key="AccentHoverColor">#6AA0FF</Color>
+    <Color x:Key="AccentPressedColor">#3B78E6</Color>
+    <Color x:Key="SuccessColor">#3DD68C</Color>
+    <Color x:Key="WarningColor">#F2B84B</Color>
+    <Color x:Key="DangerColor">#F2687A</Color>
+
+    <SolidColorBrush x:Key="WindowBrush" Color="{StaticResource WindowColor}" />
+    <SolidColorBrush x:Key="SidebarBrush" Color="{StaticResource SidebarColor}" />
+    <SolidColorBrush x:Key="SurfaceBrush" Color="{StaticResource SurfaceColor}" />
+    <SolidColorBrush x:Key="SurfaceRaisedBrush" Color="{StaticResource SurfaceRaisedColor}" />
+    <SolidColorBrush x:Key="SurfaceHoverBrush" Color="{StaticResource SurfaceHoverColor}" />
+    <SolidColorBrush x:Key="InputBrush" Color="{StaticResource InputColor}" />
+    <SolidColorBrush x:Key="BorderBrush" Color="{StaticResource BorderColor}" />
+    <SolidColorBrush x:Key="BorderStrongBrush" Color="{StaticResource BorderStrongColor}" />
+    <SolidColorBrush x:Key="TextBrush" Color="{StaticResource TextColor}" />
+    <SolidColorBrush x:Key="MutedBrush" Color="{StaticResource MutedColor}" />
+    <SolidColorBrush x:Key="SubtleBrush" Color="{StaticResource SubtleColor}" />
+    <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
+    <SolidColorBrush x:Key="AccentHoverBrush" Color="{StaticResource AccentHoverColor}" />
+    <SolidColorBrush x:Key="AccentPressedBrush" Color="{StaticResource AccentPressedColor}" />
+    <SolidColorBrush x:Key="AccentSoftBrush" Color="#224C8DFF" />
+    <SolidColorBrush x:Key="SuccessBrush" Color="{StaticResource SuccessColor}" />
+    <SolidColorBrush x:Key="SuccessSoftBrush" Color="#1F3DD68C" />
+    <SolidColorBrush x:Key="WarningBrush" Color="{StaticResource WarningColor}" />
+    <SolidColorBrush x:Key="WarningSoftBrush" Color="#1FF2B84B" />
+    <SolidColorBrush x:Key="DangerBrush" Color="{StaticResource DangerColor}" />
+    <SolidColorBrush x:Key="DangerSoftBrush" Color="#1FF2687A" />
+    <SolidColorBrush x:Key="SelectionBrush" Color="#664C8DFF" />
+    <SolidColorBrush x:Key="CloseHoverBrush" Color="#C42B1C" />
+
+    <!-- Route badges: traffic that bypasses the VPN vs. traffic that goes through it. -->
+    <SolidColorBrush x:Key="BypassBrush" Color="{StaticResource WarningColor}" />
+    <SolidColorBrush x:Key="BypassSoftBrush" Color="#1FF2B84B" />
+    <SolidColorBrush x:Key="VpnBrush" Color="{StaticResource AccentColor}" />
+    <SolidColorBrush x:Key="VpnSoftBrush" Color="#224C8DFF" />
+
+    <CornerRadius x:Key="CardRadius">10</CornerRadius>
+    <CornerRadius x:Key="ControlRadius">6</CornerRadius>
+
+    <Style x:Key="PageTitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="22" />
+        <Setter Property="FontWeight" Value="Bold" />
+        <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+    </Style>
+
+    <Style x:Key="PageSubtitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="13" />
+        <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+        <Setter Property="Margin" Value="0,4,0,0" />
+    </Style>
+
+    <Style x:Key="SectionTitle" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="15" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+    </Style>
+
+    <Style x:Key="SectionHint" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+        <Setter Property="Margin" Value="0,3,0,0" />
+    </Style>
+
+    <Style x:Key="FieldLabel" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="12" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
+        <Setter Property="Margin" Value="0,0,0,5" />
+    </Style>
+
+    <Style x:Key="MutedText" TargetType="TextBlock">
+        <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
+        <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+
+    <Style x:Key="CaptionText" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="11" />
+        <Setter Property="FontWeight" Value="SemiBold" />
+        <Setter Property="Foreground" Value="{StaticResource SubtleBrush}" />
+    </Style>
+
+    <Style x:Key="Icon" TargetType="TextBlock">
+        <Setter Property="FontFamily" Value="{StaticResource IconFont}" />
+        <Setter Property="FontSize" Value="14" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+        <Setter Property="HorizontalAlignment" Value="Center" />
+        <Setter Property="TextOptions.TextRenderingMode" Value="Grayscale" />
+    </Style>
+
+    <Style x:Key="Card" TargetType="Border">
+        <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+        <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="{StaticResource CardRadius}" />
+        <Setter Property="Padding" Value="18" />
+    </Style>
+
+    <Style x:Key="Badge" TargetType="Border">
+        <Setter Property="CornerRadius" Value="4" />
+        <Setter Property="Padding" Value="7,2" />
+        <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <Style x:Key="BadgeText" TargetType="TextBlock">
+        <Setter Property="FontSize" Value="10.5" />
+        <Setter Property="FontWeight" Value="Bold" />
+    </Style>
+
+    <Style x:Key="NoticeBorder" TargetType="Border">
+        <Setter Property="Background" Value="{StaticResource WarningSoftBrush}" />
+        <Setter Property="BorderBrush" Value="#55F2B84B" />
+        <Setter Property="BorderThickness" Value="1" />
+        <Setter Property="CornerRadius" Value="{StaticResource ControlRadius}" />
+        <Setter Property="Padding" Value="12,9" />
+    </Style>
+</ResourceDictionary>

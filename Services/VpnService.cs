@@ -14,8 +14,12 @@ public sealed class VpnService : IDisposable
     private readonly TimeSpan _startupProbeDelay;
     private readonly TimeSpan _wintunReleaseDelay;
     private readonly TimeSpan _processExitReleaseDelay;
+    private readonly ISystemProxyManager _systemProxyManager;
+    private const int MaxLogEntries = 500;
+    private readonly object _logSync = new();
     private readonly List<string> _logs = [];
     private IVpnClientProcess? _process;
+    private VpnConnectionMode? _activeConnectionMode;
     private string? _lastMessagePattern;
     private int _duplicateCount;
     private bool _disposed;
@@ -25,10 +29,25 @@ public sealed class VpnService : IDisposable
 
     public VpnStatus Status { get; private set; } = VpnStatus.Disconnected;
     public string? ErrorMessage { get; private set; }
-    public IReadOnlyList<string> Logs => _logs.AsReadOnly();
+    /// <summary>
+    /// A snapshot of the session log. Engine output arrives on background threads, so callers get a copy.
+    /// </summary>
+    public IReadOnlyList<string> Logs
+    {
+        get
+        {
+            lock (_logSync)
+            {
+                return _logs.ToArray();
+            }
+        }
+    }
 
     public VpnService(ConfigService configService)
-        : this(configService, startInfo => new VpnClientProcess(startInfo))
+        : this(
+            configService,
+            startInfo => new VpnClientProcess(startInfo),
+            systemProxyManager: new WindowsSystemProxyManager(configService.AppDataDirectory))
     {
     }
 
@@ -38,7 +57,8 @@ public sealed class VpnService : IDisposable
         TimeSpan? startupProbeDelay = null,
         TimeSpan? wintunReleaseDelay = null,
         TimeSpan? processExitReleaseDelay = null,
-        GeoIpService? geoIpService = null)
+        GeoIpService? geoIpService = null,
+        ISystemProxyManager? systemProxyManager = null)
     {
         _configService = configService;
         _geoIpService = geoIpService ?? new GeoIpService(configService.AppDataDirectory);
@@ -46,6 +66,16 @@ public sealed class VpnService : IDisposable
         _startupProbeDelay = startupProbeDelay ?? TimeSpan.FromSeconds(2);
         _wintunReleaseDelay = wintunReleaseDelay ?? TimeSpan.FromSeconds(5);
         _processExitReleaseDelay = processExitReleaseDelay ?? TimeSpan.FromSeconds(3);
+        _systemProxyManager = systemProxyManager ?? new NullSystemProxyManager();
+
+        try
+        {
+            _systemProxyManager.RecoverStaleState();
+        }
+        catch (Exception ex)
+        {
+            AddLog($"WARN Could not restore stale system proxy settings: {ex.Message}");
+        }
     }
 
     public async Task ConnectAsync(ServerConfig config)
@@ -66,7 +96,10 @@ public sealed class VpnService : IDisposable
         {
             SetStatus(VpnStatus.Connecting);
             ErrorMessage = null;
-            AddLog($"Connecting to {config.Hostname}...");
+            _activeConnectionMode = config.ConnectionMode;
+            AddLog(config.ConnectionMode == VpnConnectionMode.SystemProxy
+                ? $"Connecting to {config.Hostname} in System Proxy mode..."
+                : $"Connecting to {config.Hostname} in Full Tunnel mode...");
 
             var exePath = await _configService.GetTrustTunnelExecutableAsync();
             if (!File.Exists(exePath))
@@ -77,19 +110,32 @@ public sealed class VpnService : IDisposable
                     Path.Combine(clientDir, "trusttunnel_client.exe"));
             }
 
-            var wintunPath = Path.Combine(Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory, "wintun.dll");
-            if (!File.Exists(wintunPath))
+            if (config.ConnectionMode == VpnConnectionMode.FullTunnel)
             {
-                throw new FileNotFoundException(
-                    $"Wintun driver not found. Place wintun.dll next to {Path.GetFileName(exePath)} in: {Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory}",
-                    wintunPath);
+                var wintunPath = Path.Combine(Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory, "wintun.dll");
+                if (!File.Exists(wintunPath))
+                {
+                    throw new FileNotFoundException(
+                        $"Wintun driver not found. Place wintun.dll next to {Path.GetFileName(exePath)} in: {Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory}",
+                        wintunPath);
+                }
             }
 
             AddLog("Creating configuration file...");
-            var geoIpResult = await ResolveGeoIpExclusionsAsync(config);
+            var geoIpResult = config.ConnectionMode == VpnConnectionMode.SystemProxy
+                ? new GeoIpResolutionResult([], [], [], UsedCache: false)
+                : await ResolveGeoIpExclusionsAsync(config);
             await _configService.WriteConfigFileAsync(config, geoIpResult.Cidrs);
             var configPath = await _configService.GetConfigFilePathAsync();
-            LogSplitTunnelConfiguration(config, geoIpResult);
+            if (config.ConnectionMode == VpnConnectionMode.SystemProxy)
+            {
+                AddLog($"Local SOCKS5 listener: 127.0.0.1:{ServerConfig.SystemProxySocksPort}.");
+                AddLog("System Proxy mode routes proxy-aware applications only; TUN split-tunnel rules are not applied.");
+            }
+            else
+            {
+                LogSplitTunnelConfiguration(config, geoIpResult);
+            }
 
             AddLog("Starting Veil client...");
             var startInfo = new ProcessStartInfo
@@ -118,16 +164,21 @@ public sealed class VpnService : IDisposable
                 if (wasCurrentProcess)
                 {
                     _process = null;
+                    RestoreSystemProxyIfNeeded();
                 }
 
-                _lastMessagePattern = null;
-                _duplicateCount = 0;
+                lock (_logSync)
+                {
+                    _lastMessagePattern = null;
+                    _duplicateCount = 0;
+                }
 
                 if (wasCurrentProcess && Status is VpnStatus.Connected or VpnStatus.Connecting)
                 {
                     await Task.Delay(_processExitReleaseDelay);
                     if (_process == null && Status is VpnStatus.Connected or VpnStatus.Connecting)
                     {
+                        _activeConnectionMode = null;
                         SetStatus(VpnStatus.Disconnected);
                     }
                 }
@@ -170,7 +221,7 @@ public sealed class VpnService : IDisposable
 
                 if (exitCode != 0)
                 {
-                    var startupError = VpnStartupErrorClassifier.Classify(exitCode, _logs);
+                    var startupError = VpnStartupErrorClassifier.Classify(exitCode, Logs);
                     ErrorMessage = startupError.Message;
                     foreach (var message in startupError.LogMessages.Take(startupError.WaitForWintunRelease ? 1 : int.MaxValue))
                     {
@@ -197,6 +248,20 @@ public sealed class VpnService : IDisposable
                 throw new InvalidOperationException("Process exited immediately after start.");
             }
 
+            if (config.ConnectionMode == VpnConnectionMode.SystemProxy)
+            {
+                _systemProxyManager.EnableSocksProxy(ServerConfig.SystemProxySocksPort);
+
+                if (process.HasExited || !ReferenceEquals(_process, process))
+                {
+                    RestoreSystemProxyIfNeeded();
+                    process.Dispose();
+                    throw new InvalidOperationException("Process exited while System Proxy was being enabled.");
+                }
+
+                AddLog("Windows System Proxy enabled through the local TrustTunnel SOCKS5 listener.");
+            }
+
             AddLog("Connected successfully.");
             SetStatus(VpnStatus.Connected);
         }
@@ -211,6 +276,8 @@ public sealed class VpnService : IDisposable
             }
             else
             {
+                RestoreSystemProxyIfNeeded();
+                _activeConnectionMode = null;
                 SetStatus(VpnStatus.Disconnected);
             }
 
@@ -222,7 +289,9 @@ public sealed class VpnService : IDisposable
 
     private async Task DisconnectAsync(bool clearError)
     {
-        if (Status == VpnStatus.Disconnected && _process == null)
+        if (Status == VpnStatus.Disconnected &&
+            _process == null &&
+            !_systemProxyManager.IsEnabled)
         {
             return;
         }
@@ -263,8 +332,14 @@ public sealed class VpnService : IDisposable
 
             _process = null;
             process?.Dispose();
-            AddLog("Waiting for Wintun adapter to release...");
-            await Task.Delay(_wintunReleaseDelay);
+            RestoreSystemProxyIfNeeded();
+            if (_activeConnectionMode == VpnConnectionMode.FullTunnel)
+            {
+                AddLog("Waiting for Wintun adapter to release...");
+                await Task.Delay(_wintunReleaseDelay);
+            }
+
+            _activeConnectionMode = null;
             AddLog("Disconnected.");
             if (clearError)
             {
@@ -276,14 +351,16 @@ public sealed class VpnService : IDisposable
         catch (Exception ex)
         {
             AddLog($"Error during disconnect: {ex.Message}");
+            RestoreSystemProxyIfNeeded();
             _process = null;
+            _activeConnectionMode = null;
             SetStatus(VpnStatus.Disconnected);
         }
     }
 
     public async Task ShutdownAsync()
     {
-        if (_process != null)
+        if (_process != null || _systemProxyManager.IsEnabled)
         {
             await DisconnectAsync();
         }
@@ -291,9 +368,13 @@ public sealed class VpnService : IDisposable
 
     public void ClearLogs()
     {
-        _logs.Clear();
-        _lastMessagePattern = null;
-        _duplicateCount = 0;
+        lock (_logSync)
+        {
+            _logs.Clear();
+            _lastMessagePattern = null;
+            _duplicateCount = 0;
+        }
+
         StateChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -304,6 +385,24 @@ public sealed class VpnService : IDisposable
         if (line.Contains(" INFO ", StringComparison.Ordinal)) return $"INFO {line}";
         if (line.Contains(" DEBUG ", StringComparison.Ordinal) || line.Contains(" TRACE ", StringComparison.Ordinal)) return $"DEBUG {line}";
         return line;
+    }
+
+    private void RestoreSystemProxyIfNeeded()
+    {
+        if (!_systemProxyManager.IsEnabled)
+        {
+            return;
+        }
+
+        try
+        {
+            _systemProxyManager.Restore();
+            AddLog("Windows System Proxy settings restored.");
+        }
+        catch (Exception ex)
+        {
+            AddLog($"WARN Could not restore Windows System Proxy settings: {ex.Message}");
+        }
     }
 
     private async Task<GeoIpResolutionResult> ResolveGeoIpExclusionsAsync(ServerConfig config)
@@ -333,7 +432,8 @@ public sealed class VpnService : IDisposable
     private void LogSplitTunnelConfiguration(ServerConfig config, GeoIpResolutionResult geoIpResult)
     {
         var exclusions = config.BuildTomlExclusions(geoIpResult.Cidrs);
-        AddLog($"Split tunnel mode: {config.VpnModeTomlValue}; runtime exclusions: {exclusions.Count}.");
+        var exceptionCount = exclusions.Count(entry => entry.StartsWith(SplitTunnelEntry.ExceptionPrefix, StringComparison.Ordinal));
+        AddLog($"Split tunnel mode: {config.VpnModeTomlValue}; runtime exclusions: {exclusions.Count - exceptionCount}; exceptions: {exceptionCount}.");
         if (config.SplitTunnelCountries.Count > 0)
         {
             AddLog($"Split tunnel GeoIP countries: {FormatCountryList(config.SplitTunnelCountries)}.");
@@ -357,26 +457,28 @@ public sealed class VpnService : IDisposable
     private void AddLog(string message)
     {
         var pattern = Regex.Replace(message, @"\d+", "#");
-        if (pattern == _lastMessagePattern && _logs.Count > 0)
+        string entry;
+        lock (_logSync)
         {
-            _duplicateCount++;
-            var last = _logs[^1];
-            var baseText = Regex.Replace(last, @" \(x\d+\)$", "");
-            _logs[^1] = $"{baseText} (x{_duplicateCount + 1})";
-            LogAdded?.Invoke(_logs[^1]);
-            StateChanged?.Invoke(this, EventArgs.Empty);
-            return;
-        }
-
-        _lastMessagePattern = pattern;
-        _duplicateCount = 0;
-
-        var entry = $"[{DateTime.Now:HH:mm:ss}] {message}";
-        _logs.Add(entry);
-
-        if (_logs.Count > 500)
-        {
-            _logs.RemoveAt(0);
+            if (pattern == _lastMessagePattern && _logs.Count > 0)
+            {
+                // Collapse repeated messages that differ only in numbers into "message (xN)".
+                _duplicateCount++;
+                var baseText = Regex.Replace(_logs[^1], @" \(x\d+\)$", "");
+                entry = $"{baseText} (x{_duplicateCount + 1})";
+                _logs[^1] = entry;
+            }
+            else
+            {
+                _lastMessagePattern = pattern;
+                _duplicateCount = 0;
+                entry = $"[{DateTime.Now:HH:mm:ss}] {message}";
+                _logs.Add(entry);
+                if (_logs.Count > MaxLogEntries)
+                {
+                    _logs.RemoveAt(0);
+                }
+            }
         }
 
         LogAdded?.Invoke(entry);
@@ -402,13 +504,49 @@ public sealed class VpnService : IDisposable
         }
 
         _disposed = true;
+
         try
         {
             if (_process is { HasExited: false })
             {
                 _process.ForceKill();
             }
+        }
+        catch
+        {
+            // Continue with the independent proxy and resource cleanup below.
+        }
+
+        try
+        {
             _process?.Dispose();
+        }
+        catch
+        {
+        }
+        finally
+        {
+            _process = null;
+        }
+
+        try
+        {
+            RestoreSystemProxyIfNeeded();
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            _systemProxyManager.Dispose();
+        }
+        catch
+        {
+        }
+
+        try
+        {
             _geoIpService.Dispose();
         }
         catch

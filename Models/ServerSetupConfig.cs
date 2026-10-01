@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Veil.Services;
 
 namespace Veil.Models;
 
@@ -53,19 +54,19 @@ public sealed class ServerSetupConfig
         }
 
         var defaults = DefaultConfig();
-        var sshPort = GetInt(json, "sshPort", defaults.SshPort);
-        var listenPort = GetInt(json, "listenPort", defaults.ListenPort);
+        var sshPort = JsonFields.StrictInt(json, "sshPort", defaults.SshPort);
+        var listenPort = JsonFields.StrictInt(json, "listenPort", defaults.ListenPort);
         return new ServerSetupConfig
         {
-            Host = GetString(json, "host", defaults.Host),
+            Host = JsonFields.StrictString(json, "host", defaults.Host),
             SshPort = IsValidPort(sshPort) ? sshPort : defaults.SshPort,
-            SshUsername = GetString(json, "sshUsername", defaults.SshUsername),
-            SshKeyPath = GetNullableString(json, "sshKeyPath", defaults.SshKeyPath),
-            UseKeyAuth = GetBool(json, "useKeyAuth", defaults.UseKeyAuth),
-            Domain = GetString(json, "domain", defaults.Domain),
-            Email = GetString(json, "email", defaults.Email),
+            SshUsername = JsonFields.StrictString(json, "sshUsername", defaults.SshUsername),
+            SshKeyPath = JsonFields.StrictNullableString(json, "sshKeyPath", defaults.SshKeyPath),
+            UseKeyAuth = JsonFields.StrictBool(json, "useKeyAuth", defaults.UseKeyAuth),
+            Domain = JsonFields.StrictString(json, "domain", defaults.Domain),
+            Email = JsonFields.StrictString(json, "email", defaults.Email),
             ListenPort = IsValidPort(listenPort) ? listenPort : defaults.ListenPort,
-            VpnUsername = GetString(json, "vpnUsername", defaults.VpnUsername),
+            VpnUsername = JsonFields.StrictString(json, "vpnUsername", defaults.VpnUsername),
             SshPassword = "",
             VpnPassword = ""
         }.NormalizePersistedDraft();
@@ -88,87 +89,18 @@ public sealed class ServerSetupConfig
 
     public string GenerateCredentialsToml() =>
         "[[client]]\n" +
-        $"username = \"{EscapeToml(VpnUsername)}\"\n" +
-        $"password = \"{EscapeToml(VpnPassword)}\"\n";
+        $"username = \"{TrustTunnelToml.Escape(VpnUsername)}\"\n" +
+        $"password = \"{TrustTunnelToml.Escape(VpnPassword)}\"\n";
 
     public string GenerateHostsToml() =>
         "[[main_hosts]]\n" +
-        $"hostname = \"{EscapeToml(Domain)}\"\n" +
-        $"cert_chain_path = \"/etc/letsencrypt/live/{EscapeToml(Domain)}/fullchain.pem\"\n" +
-        $"private_key_path = \"/etc/letsencrypt/live/{EscapeToml(Domain)}/privkey.pem\"\n";
-
-    private static string EscapeToml(string value) =>
-        value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+        $"hostname = \"{TrustTunnelToml.Escape(Domain)}\"\n" +
+        $"cert_chain_path = \"/etc/letsencrypt/live/{TrustTunnelToml.Escape(Domain)}/fullchain.pem\"\n" +
+        $"private_key_path = \"/etc/letsencrypt/live/{TrustTunnelToml.Escape(Domain)}/privkey.pem\"\n";
 
     private static string CleanString(string? value, string fallback) =>
         string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
 
     private static string? CleanNullableString(string? value, string? fallback) =>
         string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
-
-    private static string GetString(JsonElement json, string name, string fallback)
-    {
-        return TryGetProperty(json, name, out var value) && value.ValueKind == JsonValueKind.String
-            ? value.GetString() ?? fallback
-            : value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
-                ? fallback
-                : throw new InvalidDataException($"{name} must be a string.");
-    }
-
-    private static string? GetNullableString(JsonElement json, string name, string? fallback)
-    {
-        if (!TryGetProperty(json, name, out var value) || value.ValueKind == JsonValueKind.Null)
-        {
-            return fallback;
-        }
-
-        return value.ValueKind == JsonValueKind.String
-            ? value.GetString()
-            : throw new InvalidDataException($"{name} must be a string.");
-    }
-
-    private static int GetInt(JsonElement json, string name, int fallback)
-    {
-        if (!TryGetProperty(json, name, out var value) || value.ValueKind == JsonValueKind.Null)
-        {
-            return fallback;
-        }
-
-        return value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number)
-            ? number
-            : throw new InvalidDataException($"{name} must be a number.");
-    }
-
-    private static bool GetBool(JsonElement json, string name, bool fallback)
-    {
-        if (!TryGetProperty(json, name, out var value) || value.ValueKind == JsonValueKind.Null)
-        {
-            return fallback;
-        }
-
-        return value.ValueKind switch
-        {
-            JsonValueKind.True => true,
-            JsonValueKind.False => false,
-            _ => throw new InvalidDataException($"{name} must be a boolean.")
-        };
-    }
-
-    private static bool TryGetProperty(JsonElement json, string name, out JsonElement value)
-    {
-        if (json.ValueKind == JsonValueKind.Object)
-        {
-            foreach (var property in json.EnumerateObject())
-            {
-                if (property.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
-                    value = property.Value;
-                    return true;
-                }
-            }
-        }
-
-        value = default;
-        return false;
-    }
 }
