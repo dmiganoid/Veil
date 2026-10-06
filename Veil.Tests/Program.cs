@@ -44,6 +44,7 @@ public static class Program
             ("SplitTunnelEntry coverage follows engine matching", TestSplitTunnelEntryCoverage),
             ("DomainGroupsData keeps rules and exceptions exclusive", TestDomainGroupsRulesAndExceptionsAreExclusive),
             ("DomainGroupsData reports which rules an exception overrides", TestDomainGroupsReportsOverriddenRules),
+            ("ConfigService handles non-ASCII paths with spaces", TestConfigServiceHandlesNonAsciiPathWithSpaces),
             ("ConfigService persists routing exceptions", TestConfigServicePersistsRoutingExceptions),
             ("ConfigService imports and exports routing exceptions", TestConfigServiceImportsRoutingExceptions),
             ("ConfigService loads legacy TV Gateway configs", TestConfigServiceLoadsLegacyTvGatewayConfig),
@@ -1200,6 +1201,36 @@ public static class Program
         finally
         {
             Directory.Delete(tempDir, recursive: true);
+        }
+    }
+
+    private static async Task TestConfigServiceHandlesNonAsciiPathWithSpaces()
+    {
+        var tempDir = Path.Combine(Path.GetTempPath(), "Veil.Tests", Guid.NewGuid().ToString("N"), "Мой профиль", "Конфиг Veil");
+
+        try
+        {
+            var service = new ConfigService(tempDir);
+            var config = new ServerConfig { Hostname = "vpn.example.com", Address = "203.0.113.10" };
+            await service.SaveConfigAsync(config);
+            await service.WriteConfigFileAsync(config);
+
+            var configPath = await service.GetConfigFilePathAsync();
+            Assert(configPath.StartsWith(tempDir, StringComparison.Ordinal), "Client config should live in the non-ASCII app data directory.");
+            Assert(File.Exists(configPath), "Client config should be written to a path with Cyrillic and spaces.");
+            Assert((await service.LoadConfigAsync()).Hostname == "vpn.example.com", "Config should round-trip through a non-ASCII path.");
+
+            var exportPath = Path.Combine(tempDir, "экспорт конфига.json");
+            await service.ExportConfigAsync(config, exportPath);
+            Assert((await service.ImportConfigAsync(exportPath)).Address == "203.0.113.10", "Export/import should work with a Cyrillic file name.");
+        }
+        finally
+        {
+            var root = Path.GetFullPath(Path.Combine(tempDir, "..", ".."));
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
         }
     }
 

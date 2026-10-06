@@ -13,7 +13,7 @@
     <AssemblyTitle>Veil</AssemblyTitle>
     <AssemblyName>Veil</AssemblyName>
     <RootNamespace>Veil</RootNamespace>
-    <Version>0.2.0</Version>
+    <Version>0.2.1</Version>
     <Authors>Veil contributors</Authors>
     <Description>Windows WPF client for TrustTunnel VPN with split tunneling and server setup tools.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>

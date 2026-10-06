@@ -144,11 +144,13 @@ public sealed class VpnService : IDisposable
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8,
                 CreateNoWindow = true,
                 WorkingDirectory = Path.GetDirectoryName(exePath) ?? AppContext.BaseDirectory
             };
             startInfo.ArgumentList.Add("--config");
-            startInfo.ArgumentList.Add(configPath);
+            startInfo.ArgumentList.Add(ToEngineSafePath(configPath));
             startInfo.ArgumentList.Add("--loglevel");
             startInfo.ArgumentList.Add(config.LogLevel);
 
@@ -377,6 +379,40 @@ public sealed class VpnService : IDisposable
 
         StateChanged?.Invoke(this, EventArgs.Empty);
     }
+
+    /// <summary>
+    /// The engine may fail to open a config whose path has non-ASCII characters, so hand it the ASCII-only
+    /// 8.3 form when the volume provides one. Falls back to the original path otherwise.
+    /// </summary>
+    internal static string ToEngineSafePath(string path)
+    {
+        if (path.All(char.IsAscii) || !OperatingSystem.IsWindows())
+        {
+            return path;
+        }
+
+        try
+        {
+            var buffer = new StringBuilder(1024);
+            var length = GetShortPathName(path, buffer, buffer.Capacity);
+            if (length > 0 && length < buffer.Capacity)
+            {
+                var shortPath = buffer.ToString();
+                if (shortPath.All(char.IsAscii))
+                {
+                    return shortPath;
+                }
+            }
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+        }
+
+        return path;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, EntryPoint = "GetShortPathNameW")]
+    private static extern int GetShortPathName(string longPath, StringBuilder shortPath, int bufferLength);
 
     private static string FormatLogLine(string line)
     {
